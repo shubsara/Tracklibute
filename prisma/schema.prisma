@@ -1,0 +1,334 @@
+// Tracklibute — Foundation schema.
+//
+// Conventions:
+// - Every tenant-owned table carries `organization_id` and is protected by
+//   PostgreSQL Row-Level Security (see the `rls_and_guards` migration).
+// - `users` is the only global table: a user can belong to several organizations.
+// - No CRM / email / contact / deal / meeting models yet. Those arrive with the
+//   normalized sales-context specs once Gmail and HubSpot adapters exist.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Identity & organization ───────────────────────────────────────────────
+
+model Organization {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  members            OrganizationMember[]
+  integrations       Integration[]
+  responsibilities   Responsibility[]
+  responsibilityRuns ResponsibilityRun[]
+  recommendations    Recommendation[]
+  proposedActions    ProposedAction[]
+  approvals          Approval[]
+  auditLogs          AuditLog[]
+
+  @@map("organizations")
+}
+
+model User {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  memberships OrganizationMember[]
+
+  @@map("users")
+}
+
+enum MemberRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+
+  @@map("member_role")
+}
+
+model OrganizationMember {
+  id             String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String     @map("organization_id") @db.Uuid
+  userId         String     @map("user_id") @db.Uuid
+  role           MemberRole @default(MEMBER)
+  createdAt      DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, userId])
+  @@index([userId])
+  @@map("organization_members")
+}
+
+// ─── Integrations (abstraction only — no OAuth / sync in Foundation) ───────
+
+enum IntegrationProvider {
+  GMAIL
+  HUBSPOT
+  GOOGLE_CALENDAR
+
+  @@map("integration_provider")
+}
+
+enum IntegrationStatus {
+  PENDING
+  CONNECTED
+  ERROR
+  DISCONNECTED
+
+  @@map("integration_status")
+}
+
+model Integration {
+  id                   String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId       String              @map("organization_id") @db.Uuid
+  provider             IntegrationProvider
+  status               IntegrationStatus   @default(PENDING)
+  // Provider-side account identifier (mailbox address, HubSpot portal id, ...).
+  externalAccountId    String?             @map("external_account_id")
+  scopes               String[]            @default([])
+  // AES-256-GCM envelope. Never selected into client-facing DTOs.
+  encryptedCredentials String?             @map("encrypted_credentials")
+  connectedByUserId    String?             @map("connected_by_user_id") @db.Uuid
+  lastSyncedAt         DateTime?           @map("last_synced_at") @db.Timestamptz(3)
+  lastError            String?             @map("last_error")
+  createdAt            DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, provider, externalAccountId])
+  @@index([organizationId, provider])
+  @@map("integrations")
+}
+
+// ─── Responsibilities (core abstraction) ───────────────────────────────────
+
+enum ResponsibilityType {
+  SYSTEM
+  CUSTOM
+
+  @@map("responsibility_type")
+}
+
+enum ResponsibilityStatus {
+  ACTIVE
+  PAUSED
+  ARCHIVED
+
+  @@map("responsibility_status")
+}
+
+model Responsibility {
+  id             String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String               @map("organization_id") @db.Uuid
+  name           String
+  description    String
+  type           ResponsibilityType
+  // Set for SYSTEM responsibilities (e.g. "lead_health"); null for CUSTOM.
+  templateKey    String?              @map("template_key")
+  status         ResponsibilityStatus @default(ACTIVE)
+  ownerUserId    String?              @map("owner_user_id") @db.Uuid
+  config         Json                 @default("{}")
+  createdAt      DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization    Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  runs            ResponsibilityRun[]
+  recommendations Recommendation[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, templateKey])
+  @@index([organizationId, status])
+  @@map("responsibilities")
+}
+
+enum ResponsibilityRunStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+
+  @@map("responsibility_run_status")
+}
+
+model ResponsibilityRun {
+  id               String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId   String                  @map("organization_id") @db.Uuid
+  responsibilityId String                  @map("responsibility_id") @db.Uuid
+  status           ResponsibilityRunStatus @default(QUEUED)
+  startedAt        DateTime?               @map("started_at") @db.Timestamptz(3)
+  finishedAt       DateTime?               @map("finished_at") @db.Timestamptz(3)
+  summary          Json?
+  error            String?
+  createdAt        DateTime                @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization    Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  responsibility  Responsibility   @relation(fields: [organizationId, responsibilityId], references: [organizationId, id], onDelete: Cascade)
+  recommendations Recommendation[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, responsibilityId, createdAt])
+  @@map("responsibility_runs")
+}
+
+// ─── Recommendations → Proposed actions → Approvals ────────────────────────
+
+enum RecommendationSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+
+  @@map("recommendation_severity")
+}
+
+enum RecommendationStatus {
+  OPEN
+  ACCEPTED
+  DISMISSED
+  SNOOZED
+  RESOLVED
+
+  @@map("recommendation_status")
+}
+
+model Recommendation {
+  id                  String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId      String                 @map("organization_id") @db.Uuid
+  responsibilityId    String                 @map("responsibility_id") @db.Uuid
+  responsibilityRunId String?                @map("responsibility_run_id") @db.Uuid
+  title               String
+  summary             String
+  severity            RecommendationSeverity @default(MEDIUM)
+  status              RecommendationStatus   @default(OPEN)
+  // Opaque pointer to the external record this is about, e.g.
+  // { "provider": "HUBSPOT", "kind": "deal", "externalId": "123" }.
+  // Normalized sales-context models replace this in a later spec.
+  subjectRef          Json?                  @map("subject_ref")
+  evidence            Json?
+  snoozedUntil        DateTime?              @map("snoozed_until") @db.Timestamptz(3)
+  createdAt           DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime               @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization      Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  responsibility    Responsibility     @relation(fields: [organizationId, responsibilityId], references: [organizationId, id], onDelete: Cascade)
+  responsibilityRun ResponsibilityRun? @relation(fields: [organizationId, responsibilityRunId], references: [organizationId, id], onDelete: NoAction)
+  proposedActions   ProposedAction[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, status])
+  @@map("recommendations")
+}
+
+enum ProposedActionStatus {
+  PROPOSED
+  APPROVED
+  REJECTED
+  EXECUTING
+  EXECUTED
+  FAILED
+  CANCELLED
+
+  @@map("proposed_action_status")
+}
+
+enum ActionSource {
+  SYSTEM
+  AI
+  USER
+
+  @@map("action_source")
+}
+
+model ProposedAction {
+  id               String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId   String               @map("organization_id") @db.Uuid
+  recommendationId String?              @map("recommendation_id") @db.Uuid
+  // Key into the closed ActionRegistry (e.g. "gmail.send_email").
+  actionType       String               @map("action_type")
+  payload          Json
+  // Copied from the registry at creation; immutable afterwards (DB-enforced).
+  requiresApproval Boolean              @map("requires_approval")
+  status           ProposedActionStatus @default(PROPOSED)
+  source           ActionSource
+  createdByUserId  String?              @map("created_by_user_id") @db.Uuid
+  result           Json?
+  error            String?
+  executedAt       DateTime?            @map("executed_at") @db.Timestamptz(3)
+  createdAt        DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  recommendation Recommendation? @relation(fields: [organizationId, recommendationId], references: [organizationId, id], onDelete: NoAction)
+  approval       Approval?
+
+  @@unique([organizationId, id])
+  @@index([organizationId, status])
+  @@map("proposed_actions")
+}
+
+enum ApprovalDecision {
+  APPROVED
+  REJECTED
+
+  @@map("approval_decision")
+}
+
+// One immutable decision per proposed action (DB-enforced: unique + no UPDATE/DELETE).
+model Approval {
+  id               String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId   String           @map("organization_id") @db.Uuid
+  proposedActionId String           @unique @map("proposed_action_id") @db.Uuid
+  decision         ApprovalDecision
+  decidedByUserId  String           @map("decided_by_user_id") @db.Uuid
+  reason           String?
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  proposedAction ProposedAction @relation(fields: [organizationId, proposedActionId], references: [organizationId, id], onDelete: Cascade)
+
+  @@unique([organizationId, proposedActionId])
+  @@map("approvals")
+}
+
+// ─── Audit (append-only, DB-enforced) ──────────────────────────────────────
+
+enum ActorType {
+  USER
+  SYSTEM
+
+  @@map("actor_type")
+}
+
+model AuditLog {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  actorType      ActorType @map("actor_type")
+  actorUserId    String?   @map("actor_user_id") @db.Uuid
+  event          String
+  entityType     String    @map("entity_type")
+  entityId       String?   @map("entity_id")
+  metadata       Json?
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, createdAt])
+  @@index([organizationId, entityType, entityId])
+  @@map("audit_logs")
+}
