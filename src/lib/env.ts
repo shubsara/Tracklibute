@@ -26,6 +26,11 @@ const envSchema = z.object({
   GMAIL_REDIRECT_URI: optionalNonEmpty.pipe(z.url().optional()),
   GMAIL_SYNC_CRON_SECRET: optionalNonEmpty.pipe(z.string().min(32).optional()),
   GMAIL_SYNC_LOOKBACK_DAYS: z.coerce.number().int().min(1).max(365).default(90),
+  // Client-side pacing of Gmail API quota units per second per mailbox.
+  // Google allows 6,000 units/min/user (= 100/s); 80 leaves headroom.
+  GMAIL_QUOTA_UNITS_PER_SECOND: z.coerce.number().int().min(1).max(1_000_000).default(80),
+  // Wall-clock budget for one sync run; large backfills continue on the next run.
+  GMAIL_SYNC_RUN_BUDGET_SECONDS: z.coerce.number().int().min(10).max(3600).default(210),
 
   // Test-only endpoint overrides (ignored unless NODE_ENV=test).
   GOOGLE_ISSUER: optionalNonEmpty,

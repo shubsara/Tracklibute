@@ -14,8 +14,20 @@ export function GmailActions({ connected }: { connected: boolean }) {
     setMessage(null);
     try {
       const res = await fetch(path, { method });
-      const body = (await res.json().catch(() => ({}))) as { error?: { message?: string }; data?: { messagesUpserted?: number } };
-      setMessage(res.ok ? (label === "sync" ? `Synced ${body.data?.messagesUpserted ?? 0} messages.` : "Disconnected.") : (body.error?.message ?? "Something went wrong."));
+      const body = (await res.json().catch(() => ({}))) as {
+        error?: { message?: string };
+        data?: { messagesUpserted?: number; outcome?: "completed" | "partial" };
+      };
+      const synced = `Synced ${body.data?.messagesUpserted ?? 0} new messages.`;
+      setMessage(
+        !res.ok
+          ? (body.error?.message ?? "Something went wrong.")
+          : label !== "sync"
+            ? "Disconnected."
+            : body.data?.outcome === "partial"
+              ? `${synced} Initial sync is still in progress and will continue automatically.`
+              : synced,
+      );
       router.refresh();
     } finally {
       setBusy(null);

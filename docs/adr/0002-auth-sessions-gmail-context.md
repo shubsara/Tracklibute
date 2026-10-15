@@ -82,6 +82,22 @@ spec. Raw mail never becomes org-readable.
 - **Triggers:** "Sync now" and a secret-protected cron endpoint. There is no
   queue, Redis or Pub/Sub at this stage.
 
+### 6a. Quota-aware, resumable backfill (amendment after the real-Gmail test)
+
+The first real-Gmail test stopped after 100 messages. Five unpaced workers
+burst past Google's per-user quota: 6,000 units/minute, with `messages.get`
+costing 20 units. The 4-second retry window couldn't recover, and every retry
+restarted the backfill and re-fetched what was already stored. The fix:
+
+- **Pacing:** a shared quota pacer (80 units/s, 2 workers) and Google's
+  truncated exponential backoff (1 s → 32 s).
+- **Time-boxed runs:** a run that runs out of budget ends as **partial**,
+  which is not a failure.
+- **Resume:** the backfill resumes by skipping stored ids.
+- **Checkpoint:** `backfill_cursor` keeps the historyId from when the
+  backfill started, so the multi-run backfill's final checkpoint is still
+  correct.
+
 ### 7. Email content is untrusted
 
 Subjects, names, snippets and bodies are external input. They are stored as

@@ -153,7 +153,7 @@ describe("failure handling", () => {
     await expect(syncGmailMailbox(auth, { trigger: "manual" })).rejects.toBeInstanceOf(UpstreamServiceError);
     const failed = await integration(integrationId);
     expect(failed.syncCursor).toBe(cursor);
-    expect(failed.lastError).toBe("Gmail is temporarily unavailable. Sync will retry later.");
+    expect(failed.lastError).toBe("Gmail is temporarily unavailable. Progress was saved; sync will resume later.");
     expect(failed.syncLeaseExpiresAt).toBeNull();
 
     google.failures = [];

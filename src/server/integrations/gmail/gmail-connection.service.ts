@@ -21,6 +21,10 @@ export interface GmailStatusDTO {
   lastSyncAttemptAt: string | null;
   lastError: string | null;
   syncInProgress: boolean;
+  /** True once the initial backfill has fully completed (incremental mode). */
+  initialSyncComplete: boolean;
+  /** An initial backfill has started and will continue on the next run. */
+  backfillInProgress: boolean;
   messagesSynced: number;
   threadsSynced: number;
 }
@@ -52,6 +56,8 @@ export async function getGmailStatus(auth: AuthContext): Promise<GmailStatusDTO>
         lastSyncAttemptAt: true,
         lastError: true,
         syncLeaseExpiresAt: true,
+        syncCursor: true,
+        backfillCursor: true,
       },
     });
     if (!row) {
@@ -63,6 +69,8 @@ export async function getGmailStatus(auth: AuthContext): Promise<GmailStatusDTO>
         lastSyncAttemptAt: null,
         lastError: null,
         syncInProgress: false,
+        initialSyncComplete: false,
+        backfillInProgress: false,
         messagesSynced: 0,
         threadsSynced: 0,
       };
@@ -80,6 +88,8 @@ export async function getGmailStatus(auth: AuthContext): Promise<GmailStatusDTO>
       lastSyncAttemptAt: row.lastSyncAttemptAt?.toISOString() ?? null,
       lastError: row.lastError,
       syncInProgress: row.syncLeaseExpiresAt !== null && row.syncLeaseExpiresAt > new Date(),
+      initialSyncComplete: row.syncCursor !== null,
+      backfillInProgress: row.syncCursor === null && row.backfillCursor !== null,
       messagesSynced,
       threadsSynced,
     };
@@ -167,7 +177,7 @@ export async function completeGmailConnect(
         encryptedCredentials: encryptCredentialsFor(auth.organizationId, row.id, result.credentials),
         tokenExpiresAt: result.tokenExpiresAt,
         lastError: null,
-        ...(mailboxChanged ? { syncCursor: null, lastSyncedAt: null } : {}),
+        ...(mailboxChanged ? { syncCursor: null, backfillCursor: null, lastSyncedAt: null } : {}),
       },
     });
     await recordAudit(tx, auth, {
@@ -212,6 +222,7 @@ export async function disconnectGmail(auth: AuthContext): Promise<void> {
         encryptedCredentials: null,
         tokenExpiresAt: null,
         syncCursor: null,
+        backfillCursor: null,
         syncLeaseExpiresAt: null,
         lastError: null,
       },

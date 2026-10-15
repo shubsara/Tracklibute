@@ -176,8 +176,13 @@ describe("protected cron endpoint", () => {
 
   it("syncs eligible mailboxes and returns counts only", async () => {
     google.mailbox(`a1-${A.slug}@gmail.test`).add(gmailMessage({ id: "A-new", threadId: "TA", from: "ceo@target.io", plain: "new private", date: daysAgo(0) }));
-    // The shared test DB may hold stale mailboxes from earlier runs; cron marks
-    // them REAUTH_REQUIRED (no longer eligible), so drain batches until ours ran.
+    // The shared test DB accumulates mailboxes from other test files/runs whose
+    // fake-Google tokens no longer exist. Retire them so this test only
+    // exercises its own fixtures (cron would otherwise mark each REAUTH_REQUIRED).
+    await ownerDb().integration.updateMany({
+      where: { provider: "GMAIL", status: "CONNECTED", id: { notIn: [ids.a1Integration, ids.b1Integration] } },
+      data: { status: "DISCONNECTED" },
+    });
     const processed = new Set<string>();
     for (let i = 0; i < 30 && !(processed.has(ids.a1Integration) && processed.has(ids.b1Integration)); i++) {
       const res = await cron(new Request("http://localhost/api/internal/cron/gmail-sync", { method: "POST", headers: { authorization: `Bearer ${CRON_SECRET}` } }));

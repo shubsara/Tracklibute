@@ -138,6 +138,10 @@ model Integration {
   lastSyncedAt         DateTime?           @map("last_synced_at") @db.Timestamptz(3)
   // Provider sync checkpoint (Gmail historyId). Advanced only after a successful sync.
   syncCursor           String?             @map("sync_cursor")
+  // Checkpoint captured when a multi-run initial backfill STARTED. Becomes
+  // syncCursor when the backfill completes, so changes during a long backfill
+  // are replayed by the first incremental sync. Null when no backfill is pending.
+  backfillCursor       String?             @map("backfill_cursor")
   // Concurrency lease: a sync may run only while it holds an unexpired lease.
   syncLeaseExpiresAt   DateTime?           @map("sync_lease_expires_at") @db.Timestamptz(3)
   lastError            String?             @map("last_error")

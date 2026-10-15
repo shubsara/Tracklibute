@@ -71,7 +71,41 @@ export interface Failure {
   times: number;
 }
 
+/** Gmail per-method quota costs (mirrors Google's "Usage limits" table). */
+function quotaCost(method: string | undefined, path: string): number {
+  if (path === "/profile") return 1;
+  if (path === "/messages") return 5;
+  if (path.startsWith("/messages/")) return 20;
+  if (path.startsWith("/threads/")) return 40;
+  if (path === "/history") return 2;
+  return method ? 0 : 0;
+}
+
+export interface TestClock {
+  now(): number;
+  sleep(ms: number): Promise<void>;
+}
+
+/** Deterministic virtual clock: sleeping advances time instantly (monotonic). */
+export class VirtualClock implements TestClock {
+  t = Date.UTC(2026, 9, 15);
+  sleeps: number[] = [];
+  now(): number {
+    return this.t;
+  }
+  async sleep(ms: number): Promise<void> {
+    this.sleeps.push(ms);
+    this.t = Math.max(this.t, this.now() + ms);
+    await new Promise((r) => setImmediate(r));
+  }
+}
+
 export class FakeGoogle {
+  /** Per-user quota emulation (null = unlimited). Uses `clock` for the sliding window. */
+  quota: { unitsPerWindow: number; windowMs: number } | null = null;
+  clock: TestClock = { now: () => Date.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) };
+  rateLimited = 0;
+  private usage = new Map<string, Array<{ t: number; units: number }>>();
   issuer = "";
   gmailBase = "";
   private server!: Server;
@@ -278,6 +312,20 @@ export class FakeGoogle {
     }
     const box = this.mailbox(at.mailbox);
     const path = url.pathname.replace("/gmail/v1/users/me", "");
+
+    if (this.quota) {
+      const now = this.clock.now();
+      const used = (this.usage.get(box.address) ?? []).filter((u) => u.t > now - this.quota!.windowMs);
+      const cost = quotaCost(req.method, path);
+      const total = used.reduce((n, u) => n + u.units, 0);
+      if (total + cost > this.quota.unitsPerWindow) {
+        this.rateLimited++;
+        this.usage.set(box.address, used);
+        return this.send(res, 429, { error: { code: 429, status: "RESOURCE_EXHAUSTED", errors: [{ reason: "rateLimitExceeded" }] } });
+      }
+      used.push({ t: now, units: cost });
+      this.usage.set(box.address, used);
+    }
 
     if (path === "/profile") return this.send(res, 200, { emailAddress: box.address, historyId: String(box.historyId) });
 

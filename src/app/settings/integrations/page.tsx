@@ -33,7 +33,15 @@ export default async function IntegrationsPage({ searchParams }: { searchParams:
               <dt className="text-neutral-500">Account</dt>
               <dd>{status.accountEmail}</dd>
               <dt className="text-neutral-500">Last sync</dt>
-              <dd>{status.syncInProgress ? "in progress…" : fmt(status.lastSyncedAt)}</dd>
+              <dd>
+                {status.syncInProgress
+                  ? "in progress…"
+                  : status.initialSyncComplete
+                    ? fmt(status.lastSyncedAt)
+                    : status.backfillInProgress
+                      ? "initial sync in progress (continues automatically)"
+                      : "not started"}
+              </dd>
               <dt className="text-neutral-500">Messages synced</dt>
               <dd>{status.messagesSynced}</dd>
               {status.lastError && (

@@ -23,7 +23,7 @@ import { INTEGRATION_PROVIDER_INFO } from "@/domain/integrations/providers";
 import { getEnv } from "@/lib/env";
 import { loadIntegrationCredentials, storeIntegrationCredentials } from "@/server/integrations/integrations.service";
 
-import { GMAIL_API_BASE_URL, GmailApiError, GmailClient } from "./gmail.client";
+import { type Clock, GMAIL_API_BASE_URL, GmailApiError, GmailClient, QuotaPacer, realClock } from "./gmail.client";
 import { mapGmailMessage } from "./gmail.mapper";
 import {
   beginGmailAuthorization,
@@ -42,21 +42,22 @@ export function gmailApiBaseUrl(): string {
   return env.NODE_ENV === "test" && env.GMAIL_API_BASE_URL ? env.GMAIL_API_BASE_URL : GMAIL_API_BASE_URL;
 }
 
-/** Translate transport errors into provider-neutral mailbox errors. */
+/** Translate transport errors into provider-neutral mailbox errors (keeping non-secret diagnostics). */
 function toMailboxError(err: unknown): unknown {
   if (err instanceof MailboxError || !(err instanceof GmailApiError)) return err;
+  const d = { endpoint: err.endpoint, httpStatus: err.status, providerReason: err.reason };
   switch (err.kind) {
     case "history_expired":
-      return new MailboxCursorExpiredError();
+      return new MailboxCursorExpiredError(d);
     case "unauthorized":
     case "forbidden":
-      return new MailboxAuthorizationRevokedError();
+      return new MailboxAuthorizationRevokedError(d);
     case "rate_limited":
-      return new MailboxRateLimitedError();
+      return new MailboxRateLimitedError(d);
     case "transient":
-      return new MailboxUnavailableError();
+      return new MailboxUnavailableError(undefined, d);
     default:
-      return new MailboxError(`Gmail returned an unexpected response (HTTP ${err.status})`, "invalid_response");
+      return new MailboxError(`Gmail returned an unexpected response (HTTP ${err.status})`, "invalid_response", d);
   }
 }
 
@@ -184,20 +185,25 @@ export class GmailTokenProvider {
 export interface GmailSourceOptions {
   actor?: "USER" | "SYSTEM";
   fetchImpl?: typeof fetch;
-  sleep?: (ms: number) => Promise<void>;
+  clock?: Clock;
+  /** Quota units/second for this run's pacer (default: GMAIL_QUOTA_UNITS_PER_SECOND). */
+  unitsPerSecond?: number;
 }
 
+/** One source = one sync run: a single shared pacer throttles all of its workers. */
 export function createGmailMailboxSource(
   auth: AuthContext,
   integrationId: string,
   opts: GmailSourceOptions = {},
 ): GmailMailboxSource {
+  const clock = opts.clock ?? realClock;
   const tokens = new GmailTokenProvider(auth, integrationId, opts.actor);
   const client = new GmailClient({
     baseUrl: gmailApiBaseUrl(),
     getAccessToken: (force) => tokens.getAccessToken(force),
     fetchImpl: opts.fetchImpl,
-    sleep: opts.sleep,
+    clock,
+    pacer: new QuotaPacer(opts.unitsPerSecond ?? getEnv().GMAIL_QUOTA_UNITS_PER_SECOND, clock),
   });
   return new GmailMailboxSource(client);
 }

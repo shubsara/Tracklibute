@@ -10,6 +10,9 @@ export const POST = authedRoute(async ({ auth, request }) => {
   if (isFormRequest(request)) return redirect("/settings/integrations?gmail=synced");
   return json({
     data: {
+      outcome: result.outcome,
+      resumed: result.resumed,
+      alreadySynced: result.alreadySynced,
       syncType: result.syncType,
       messagesUpserted: result.messagesUpserted,
       messagesDeleted: result.messagesDeleted,

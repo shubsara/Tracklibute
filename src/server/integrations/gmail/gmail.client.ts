@@ -1,5 +1,7 @@
 import "server-only";
 
+import { log } from "@/lib/log";
+
 import type {
   GmailErrorBody,
   GmailHistoryResponse,
@@ -13,12 +15,31 @@ import type {
  * Minimal Gmail REST client (users/me only). Every call sends a `fields`
  * mask so Google returns only what Tracklibute uses.
  *
- * Retries: 429 / rate-limit 403 and 5xx / network errors, with bounded
- * exponential backoff (honours Retry-After). A 401 triggers exactly one
- * forced token refresh. Errors carry only status + reason — never bodies
- * that might echo tokens.
+ * Quota: Google allows 6,000 units/minute/user/project; each method has a
+ * unit cost (QUOTA_COST). A shared QuotaPacer spaces requests so a sync stays
+ * under that budget instead of bursting into 429s.
+ *
+ * Retries:
+ *  - rate limits (429, rate-limit 403s): truncated exponential backoff per
+ *    Google's guidance — 1s, 2s, 4s … capped at 32s, + up to 1s jitter,
+ *    honouring Retry-After; the pacer is paused so sibling workers wait too.
+ *  - 5xx / network errors: short exponential backoff.
+ *  - 401: exactly one forced token refresh.
+ * Errors carry only endpoint + HTTP status + Google's reason code — never
+ * bodies or headers that might echo tokens.
  */
 export const GMAIL_API_BASE_URL = "https://gmail.googleapis.com/gmail/v1";
+
+export type GmailEndpoint = "getProfile" | "messages.list" | "messages.get" | "threads.get" | "history.list";
+
+/** Units per call (Google "Usage limits" page, updated 2026-09-10). */
+export const QUOTA_COST: Record<GmailEndpoint, number> = {
+  getProfile: 1,
+  "messages.list": 5,
+  "messages.get": 20,
+  "threads.get": 40,
+  "history.list": 2,
+};
 
 export type GmailErrorKind =
   | "unauthorized"
@@ -34,9 +55,46 @@ export class GmailApiError extends Error {
     readonly kind: GmailErrorKind,
     readonly status: number,
     readonly reason: string | null,
+    readonly endpoint: GmailEndpoint,
   ) {
-    super(`Gmail API ${kind} (HTTP ${status}${reason ? `, ${reason}` : ""})`);
+    super(`Gmail API ${endpoint} ${kind} (HTTP ${status}${reason ? `, ${reason}` : ""})`);
     this.name = "GmailApiError";
+  }
+}
+
+export interface Clock {
+  now(): number;
+  sleep(ms: number): Promise<void>;
+}
+
+export const realClock: Clock = {
+  now: () => Date.now(),
+  sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+};
+
+/**
+ * Spaces requests so that, on average, no more than `unitsPerSecond` quota
+ * units are spent. Shared by all workers of one sync run; `pauseUntil` lets a
+ * rate-limit backoff stall every worker, not just the one that was throttled.
+ */
+export class QuotaPacer {
+  private nextFreeAt = 0;
+
+  constructor(
+    readonly unitsPerSecond: number,
+    private readonly clock: Clock = realClock,
+  ) {}
+
+  async acquire(units: number): Promise<void> {
+    if (!Number.isFinite(this.unitsPerSecond)) return;
+    const now = this.clock.now();
+    const start = Math.max(now, this.nextFreeAt);
+    this.nextFreeAt = start + (units / this.unitsPerSecond) * 1000;
+    if (start > now) await this.clock.sleep(start - now);
+  }
+
+  pauseUntil(at: number): void {
+    this.nextFreeAt = Math.max(this.nextFreeAt, at);
   }
 }
 
@@ -45,35 +103,52 @@ export interface GmailClientOptions {
   /** Returns a valid access token; `forceRefresh` after a 401. */
   getAccessToken: (forceRefresh: boolean) => Promise<string>;
   fetchImpl?: typeof fetch;
+  /** @deprecated use `clock` — kept for tests that only stub sleeping. */
   sleep?: (ms: number) => Promise<void>;
-  maxRetries?: number;
+  clock?: Clock;
+  pacer?: QuotaPacer;
+  maxRateLimitRetries?: number;
+  maxTransientRetries?: number;
 }
 
-const RATE_LIMIT_REASONS = new Set(["rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"]);
+const RATE_LIMIT_REASONS = new Set(["rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded", "RESOURCE_EXHAUSTED"]);
+const RATE_LIMIT_MAX_BACKOFF_MS = 32_000;
+const RETRY_AFTER_MAX_MS = 64_000;
 
 export const MESSAGE_FIELDS = "id,threadId,labelIds,snippet,internalDate,historyId,payload";
 const HISTORY_FIELDS =
   "history(id,messagesAdded/message(id,threadId,labelIds),messagesDeleted/message(id),labelsAdded/message(id),labelsRemoved/message(id)),historyId,nextPageToken";
 
+/** Truncated exponential backoff for rate limits: min(2^n s, 32 s) + up to 1 s jitter. */
+export function rateLimitBackoffMs(attempt: number, random = Math.random): number {
+  return Math.min(RATE_LIMIT_MAX_BACKOFF_MS, 1000 * 2 ** attempt) + Math.floor(random() * 1000);
+}
+
+function transientBackoffMs(attempt: number): number {
+  return Math.min(8_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250);
+}
+
 export class GmailClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
-  private readonly sleep: (ms: number) => Promise<void>;
-  private readonly maxRetries: number;
+  private readonly clock: Clock;
+  private readonly maxRateLimitRetries: number;
+  private readonly maxTransientRetries: number;
 
   constructor(private readonly opts: GmailClientOptions) {
     this.baseUrl = (opts.baseUrl ?? GMAIL_API_BASE_URL).replace(/\/$/, "");
     this.fetchImpl = opts.fetchImpl ?? fetch;
-    this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
-    this.maxRetries = opts.maxRetries ?? 3;
+    this.clock = opts.clock ?? (opts.sleep ? { now: () => Date.now(), sleep: opts.sleep } : realClock);
+    this.maxRateLimitRetries = opts.maxRateLimitRetries ?? 5;
+    this.maxTransientRetries = opts.maxTransientRetries ?? 3;
   }
 
   getProfile(): Promise<GmailProfile> {
-    return this.get("/users/me/profile", { fields: "emailAddress,historyId" });
+    return this.get("getProfile", "/users/me/profile", { fields: "emailAddress,historyId" });
   }
 
   listMessages(input: { q?: string; pageToken?: string; maxResults?: number }): Promise<GmailListMessagesResponse> {
-    return this.get("/users/me/messages", {
+    return this.get("messages.list", "/users/me/messages", {
       q: input.q,
       pageToken: input.pageToken,
       maxResults: String(input.maxResults ?? 100),
@@ -82,11 +157,14 @@ export class GmailClient {
   }
 
   getMessage(id: string): Promise<GmailMessage> {
-    return this.get(`/users/me/messages/${encodeURIComponent(id)}`, { format: "full", fields: MESSAGE_FIELDS });
+    return this.get("messages.get", `/users/me/messages/${encodeURIComponent(id)}`, {
+      format: "full",
+      fields: MESSAGE_FIELDS,
+    });
   }
 
   getThread(id: string): Promise<GmailThread> {
-    return this.get(`/users/me/threads/${encodeURIComponent(id)}`, {
+    return this.get("threads.get", `/users/me/threads/${encodeURIComponent(id)}`, {
       format: "minimal",
       fields: "id,historyId,messages(id,internalDate,labelIds)",
     });
@@ -94,6 +172,7 @@ export class GmailClient {
 
   listHistory(input: { startHistoryId: string; pageToken?: string }): Promise<GmailHistoryResponse> {
     return this.get(
+      "history.list",
       "/users/me/history",
       {
         startHistoryId: input.startHistoryId,
@@ -107,6 +186,7 @@ export class GmailClient {
   }
 
   private async get<T>(
+    endpoint: GmailEndpoint,
     path: string,
     params: Record<string, string | string[] | undefined>,
     opts: { notFoundKind?: GmailErrorKind } = {},
@@ -118,14 +198,17 @@ export class GmailClient {
     }
 
     let refreshed = false;
-    for (let attempt = 0; ; attempt++) {
+    let rateLimitAttempts = 0;
+    let transientAttempts = 0;
+    for (;;) {
+      await this.opts.pacer?.acquire(QUOTA_COST[endpoint]);
       let res: Response;
       try {
         const token = await this.opts.getAccessToken(false);
         res = await this.fetchImpl(url, { headers: { authorization: `Bearer ${token}`, accept: "application/json" } });
       } catch (err) {
-        if (err instanceof GmailApiError || attempt >= this.maxRetries || !isNetworkError(err)) throw err;
-        await this.sleep(backoff(attempt));
+        if (err instanceof GmailApiError || transientAttempts >= this.maxTransientRetries || !isNetworkError(err)) throw err;
+        await this.clock.sleep(transientBackoffMs(transientAttempts++));
         continue;
       }
 
@@ -138,38 +221,51 @@ export class GmailClient {
           await this.opts.getAccessToken(true);
           continue;
         }
-        throw new GmailApiError("unauthorized", 401, reason);
+        throw new GmailApiError("unauthorized", 401, reason, endpoint);
       }
+
       const rateLimited = res.status === 429 || (res.status === 403 && reason !== null && RATE_LIMIT_REASONS.has(reason));
-      const transient = res.status >= 500;
-      if ((rateLimited || transient) && attempt < this.maxRetries) {
-        await this.sleep(retryAfterMs(res) ?? backoff(attempt));
+      if (rateLimited) {
+        if (rateLimitAttempts >= this.maxRateLimitRetries) throw new GmailApiError("rate_limited", res.status, reason, endpoint);
+        const delay = retryAfterMs(res) ?? rateLimitBackoffMs(rateLimitAttempts);
+        rateLimitAttempts++;
+        log.warn("gmail.rate_limited_retry", {
+          endpoint,
+          httpStatus: res.status,
+          providerReason: reason,
+          attempt: rateLimitAttempts,
+          delayMs: delay,
+        });
+        // Stall every worker sharing this pacer, not just this request.
+        this.opts.pacer?.pauseUntil(this.clock.now() + delay);
+        await this.clock.sleep(delay);
         continue;
       }
-      if (rateLimited) throw new GmailApiError("rate_limited", res.status, reason);
-      if (transient) throw new GmailApiError("transient", res.status, reason);
-      if (res.status === 404) throw new GmailApiError(opts.notFoundKind ?? "not_found", 404, reason);
-      if (res.status === 403) throw new GmailApiError("forbidden", 403, reason);
-      throw new GmailApiError("bad_request", res.status, reason);
+      if (res.status >= 500) {
+        if (transientAttempts >= this.maxTransientRetries) throw new GmailApiError("transient", res.status, reason, endpoint);
+        await this.clock.sleep(retryAfterMs(res) ?? transientBackoffMs(transientAttempts++));
+        continue;
+      }
+      if (res.status === 404) throw new GmailApiError(opts.notFoundKind ?? "not_found", 404, reason, endpoint);
+      if (res.status === 403) throw new GmailApiError("forbidden", 403, reason, endpoint);
+      throw new GmailApiError("bad_request", res.status, reason, endpoint);
     }
   }
-}
-
-function backoff(attempt: number): number {
-  return Math.min(8_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250);
 }
 
 function retryAfterMs(res: Response): number | null {
   const v = res.headers.get("retry-after");
   if (!v) return null;
   const secs = Number(v);
-  return Number.isFinite(secs) ? Math.min(30_000, Math.max(0, secs * 1000)) : null;
+  return Number.isFinite(secs) ? Math.min(RETRY_AFTER_MAX_MS, Math.max(0, secs * 1000)) : null;
 }
 
+/** Google's machine-readable reason code only (e.g. "rateLimitExceeded") — never the message text. */
 async function readReason(res: Response): Promise<string | null> {
   try {
     const body = (await res.json()) as GmailErrorBody;
-    return body.error?.errors?.[0]?.reason ?? body.error?.status ?? null;
+    const reason = body.error?.errors?.[0]?.reason ?? body.error?.status ?? null;
+    return reason && /^[A-Za-z_]{1,64}$/.test(reason) ? reason : null;
   } catch {
     return null;
   }

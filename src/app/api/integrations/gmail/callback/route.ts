@@ -10,6 +10,9 @@ import { completeGmailConnect } from "@/server/integrations/gmail/gmail-connecti
 import { syncGmailMailbox } from "@/server/integrations/gmail/gmail-sync.service";
 
 export const dynamic = "force-dynamic";
+// The initial sync runs in `after()` within this route's duration; it is
+// time-boxed (GMAIL_SYNC_RUN_BUDGET_SECONDS) and resumes on later runs.
+export const maxDuration = 300;
 
 const SETTINGS = "/settings/integrations";
 

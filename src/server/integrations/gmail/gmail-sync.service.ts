@@ -13,51 +13,60 @@ import {
   type NormalizedEmailMessage,
 } from "@/domain/email/types";
 import { getEnv } from "@/lib/env";
-import {
-  AppError,
-  ConflictError,
-  NotFoundError,
-  PolicyViolationError,
-  UpstreamServiceError,
-} from "@/lib/errors";
+import { AppError, ConflictError, NotFoundError, PolicyViolationError, UpstreamServiceError } from "@/lib/errors";
 import { log } from "@/lib/log";
 import { recordAudit } from "@/server/audit/audit-log";
 import { type Tx, withOrgScope } from "@/server/db/org-scope";
 
+import { type Clock, realClock } from "./gmail.client";
 import { createGmailMailboxSource } from "./gmail.adapter";
 import { findOwnGmailIntegration } from "./gmail-connection.service";
 
 /**
  * GmailSyncService
  *
- *   claim lease ─▶ cursor? ──no──▶ INITIAL: bounded backfill (lookback window)
- *                    │yes
- *                    ▼
- *               INCREMENTAL: History API since cursor
- *                    │ cursor expired?
- *                    ▼
- *               RECOVERY: bounded backfill + fresh cursor
- *   ─▶ idempotent batch upserts ─▶ advance cursor ONLY after success ─▶ release lease
+ *   claim lease ─▶ syncCursor? ──no──▶ INITIAL BACKFILL (resumable, multi-run)
+ *                     │yes              · backfillCursor = historyId captured when the
+ *                     ▼                   backfill FIRST started (kept across runs)
+ *                INCREMENTAL           · skips messages already stored → resumes
+ *                (History API)         · on completion: syncCursor ← backfillCursor
+ *                     │ cursor expired?
+ *                     ▼
+ *                RECOVERY: reset to a fresh initial backfill
  *
- * Every database write runs under the mailbox owner's AuthContext, inside
- * RLS. Message content is never logged or audited.
+ *   Every run is time-boxed (GMAIL_SYNC_RUN_BUDGET_SECONDS). A run that stops
+ *   because its budget ran out ends as PARTIAL — not a failure: the lease is
+ *   released, no error is recorded, and the next run (cron / "Sync now")
+ *   continues. The sync checkpoint only ever advances after a COMPLETE run.
+ *
+ *   Gmail calls are paced to the per-user quota (QuotaPacer) with 2 workers;
+ *   rate limits back off exponentially; a fatal error stops sibling workers.
+ *   All writes are idempotent and run under the owner's AuthContext + RLS.
+ *   Message content is never logged or audited.
  */
 export const LEASE_SECONDS = 10 * 60;
 export const BATCH_SIZE = 100;
-const FETCH_CONCURRENCY = 5;
+export const FETCH_CONCURRENCY = 2;
 
 export type SyncType = "initial" | "incremental" | "recovery";
+export type SyncOutcome = "completed" | "partial";
 
 export interface GmailSyncResult {
   integrationId: string;
   syncType: SyncType;
+  outcome: SyncOutcome;
+  /** True when this run continued a backfill started by an earlier run. */
+  resumed: boolean;
   trigger: "manual" | "cron" | "connect";
   messagesUpserted: number;
   messagesDeleted: number;
+  /** Listed messages skipped because they were already stored (resume). */
+  alreadySynced: number;
   threadsTouched: number;
   skipped: number;
   cursorBefore: string | null;
-  cursorAfter: string;
+  /** Committed checkpoint; null when the run was partial (nothing committed). */
+  cursorAfter: string | null;
   durationMs: number;
 }
 
@@ -67,6 +76,14 @@ export interface GmailSyncOptions {
   now?: Date;
   /** Injected in tests; defaults to the Gmail adapter. */
   source?: MailboxSource;
+  /** Time source for pacing, backoff and the run deadline (virtual in tests). */
+  clock?: Clock;
+  /** Absolute deadline (clock ms). Defaults to now + GMAIL_SYNC_RUN_BUDGET_SECONDS. */
+  deadlineAt?: number;
+  /** Cap on message fetches this run (tests / operational safety). */
+  maxMessageFetches?: number;
+  /** Override pacing for this run (quota units per second). */
+  unitsPerSecond?: number;
 }
 
 class LeaseLostError extends Error {
@@ -81,7 +98,14 @@ interface SyncCtx {
   integrationId: string;
   lease: Date;
   mailboxAddress: string;
-  counters: { upserted: number; deleted: number; skipped: number; threads: Set<string> };
+  clock: Clock;
+  deadlineAt: number;
+  fetchesRemaining: number;
+  counters: { upserted: number; deleted: number; skipped: number; alreadySynced: number; threads: Set<string> };
+}
+
+function budgetExhausted(ctx: SyncCtx): boolean {
+  return ctx.fetchesRemaining <= 0 || ctx.clock.now() >= ctx.deadlineAt;
 }
 
 // ─── Lease (single-row compare-and-set; stale leases expire) ────────────────
@@ -271,17 +295,26 @@ async function deleteMessages(ctx: SyncCtx, externalIds: string[]): Promise<void
 
 // ─── Fetch helpers ──────────────────────────────────────────────────────────
 
-/** Fetch messages with bounded concurrency. Per-message bad responses are skipped, not fatal. */
+/**
+ * Fetch messages with bounded concurrency. Per-message bad responses are
+ * skipped, not fatal. On a fatal error, sibling workers stop picking up new
+ * work, all in-flight requests settle, and the first error is rethrown — so
+ * nothing keeps calling Gmail after the run has failed.
+ */
 async function fetchMessages(
+  ctx: SyncCtx,
   source: MailboxSource,
   ids: readonly string[],
-): Promise<{ found: NormalizedEmailMessage[]; gone: string[]; skipped: number }> {
+): Promise<{ found: NormalizedEmailMessage[]; gone: string[]; skipped: number; attempted: number }> {
   const found: NormalizedEmailMessage[] = [];
   const gone: string[] = [];
   let skipped = 0;
   let next = 0;
+  let failure: { error: unknown } | null = null;
   const worker = async () => {
-    while (next < ids.length) {
+    // Stop taking new ids once the run deadline passes; unfetched ids are
+    // simply not stored and get picked up by the next run (resume).
+    while (!failure && next < ids.length && ctx.clock.now() < ctx.deadlineAt) {
       const id = ids[next++]!;
       try {
         const msg = await source.getMessage(id);
@@ -289,54 +322,116 @@ async function fetchMessages(
         else gone.push(id);
       } catch (err) {
         if (err instanceof MailboxError && err.kind === "invalid_response") skipped++;
-        else throw err;
+        else failure ??= { error: err };
       }
     }
   };
   await Promise.all(Array.from({ length: Math.min(FETCH_CONCURRENCY, ids.length) }, worker));
-  return { found, gone, skipped };
+  if (failure) throw (failure as { error: unknown }).error;
+  return { found, gone, skipped, attempted: Math.min(next, ids.length) };
 }
 
-async function processIdsInBatches(ctx: SyncCtx, source: MailboxSource, ids: readonly string[], goneMeansDeleted: boolean) {
-  for (let i = 0; i < ids.length; i += BATCH_SIZE) {
-    const { found, gone, skipped } = await fetchMessages(source, ids.slice(i, i + BATCH_SIZE));
+/** Returns false if the run budget ran out before every id was processed. */
+async function processIdsInBatches(
+  ctx: SyncCtx,
+  source: MailboxSource,
+  ids: readonly string[],
+  goneMeansDeleted: boolean,
+): Promise<boolean> {
+  for (let i = 0; i < ids.length; ) {
+    if (budgetExhausted(ctx)) return false;
+    const take = Math.min(BATCH_SIZE, ctx.fetchesRemaining, ids.length - i);
+    const slice = ids.slice(i, i + take);
+    i += take;
+    const { found, gone, skipped, attempted } = await fetchMessages(ctx, source, slice);
+    ctx.fetchesRemaining -= attempted;
     ctx.counters.skipped += skipped + (goneMeansDeleted ? 0 : gone.length);
     await persistBatch(ctx, found);
     if (goneMeansDeleted) await deleteMessages(ctx, gone);
     await extendLease(ctx);
+    if (attempted < slice.length) return false; // deadline reached mid-batch
   }
+  return true;
+}
+
+/** Ids from `ids` not yet stored for this mailbox (one indexed query). */
+async function filterUnsynced(ctx: SyncCtx, ids: readonly string[]): Promise<string[]> {
+  if (ids.length === 0) return [];
+  const stored = await withOrgScope(ctx.auth, (tx) =>
+    tx.emailMessage.findMany({
+      where: {
+        organizationId: ctx.auth.organizationId,
+        mailboxUserId: ctx.auth.userId,
+        integrationId: ctx.integrationId,
+        externalMessageId: { in: [...ids] },
+      },
+      select: { externalMessageId: true },
+    }),
+  );
+  const have = new Set(stored.map((m) => m.externalMessageId));
+  ctx.counters.alreadySynced += have.size;
+  return ids.filter((id) => !have.has(id));
+}
+
+/** Compare-and-set a column while we still hold the lease. */
+async function setBackfillCursor(ctx: SyncCtx, cursor: string | null): Promise<void> {
+  const n = await withOrgScope(ctx.auth, (tx) => tx.$executeRaw`
+    UPDATE integrations SET backfill_cursor = ${cursor}, updated_at = now()
+     WHERE id = ${ctx.integrationId}::uuid AND sync_lease_expires_at = ${ctx.lease}`);
+  if (n === 0) throw new LeaseLostError();
 }
 
 // ─── Sync strategies ────────────────────────────────────────────────────────
 
-async function backfill(ctx: SyncCtx, source: MailboxSource, since: Date): Promise<string> {
-  // Capture the cursor BEFORE listing so changes during the backfill are
-  // picked up by the next incremental sync (upserts make overlap harmless).
+type StepResult = { complete: true; cursor: string } | { complete: false };
+
+/**
+ * Initial backfill, resumable across runs. The checkpoint is the historyId
+ * from when the backfill FIRST started (persisted as backfill_cursor), so
+ * deletions/label changes during a multi-run backfill are replayed later.
+ * Already-stored messages are not fetched again.
+ */
+async function backfill(
+  ctx: SyncCtx,
+  source: MailboxSource,
+  since: Date,
+  existingBackfillCursor: string | null,
+): Promise<StepResult> {
   const { address, cursor } = await source.getMailbox();
   ctx.mailboxAddress = address;
+  const startCursor = existingBackfillCursor ?? cursor;
+  if (!existingBackfillCursor) await setBackfillCursor(ctx, startCursor);
+
   let pageToken: string | undefined;
   do {
+    if (budgetExhausted(ctx)) return { complete: false };
     const page = await source.listMessageIdsSince(since, pageToken);
-    await processIdsInBatches(ctx, source, page.ids, false);
+    const missing = await filterUnsynced(ctx, page.ids);
+    if (!(await processIdsInBatches(ctx, source, missing, false))) return { complete: false };
     pageToken = page.nextPageToken ?? undefined;
   } while (pageToken);
-  return cursor;
+  return { complete: true, cursor: startCursor };
 }
 
-async function incremental(ctx: SyncCtx, source: MailboxSource, cursor: string): Promise<string> {
+/**
+ * Incremental sync from the stored cursor. If the budget runs out the cursor
+ * is NOT advanced; the next run replays from the same cursor (idempotent).
+ */
+async function incremental(ctx: SyncCtx, source: MailboxSource, cursor: string): Promise<StepResult> {
   const { address } = await source.getMailbox();
   ctx.mailboxAddress = address;
   let pageToken: string | undefined;
   let latest = cursor;
   do {
+    if (budgetExhausted(ctx)) return { complete: false };
     const page = await source.listChangesSince(cursor, pageToken);
     await deleteMessages(ctx, [...page.deleted]);
     // A changed message that is now gone or excluded (trashed, spam) is removed.
-    await processIdsInBatches(ctx, source, page.changed, true);
+    if (!(await processIdsInBatches(ctx, source, page.changed, true))) return { complete: false };
     latest = page.cursor;
     pageToken = page.nextPageToken ?? undefined;
   } while (pageToken);
-  return latest;
+  return { complete: true, cursor: latest };
 }
 
 // ─── Public entry point ─────────────────────────────────────────────────────
@@ -350,10 +445,18 @@ function safeFailure(err: unknown): { code: string; message: string; appError: A
     };
   }
   if (err instanceof MailboxError && err.kind === "rate_limited") {
-    return { code: "rate_limited", message: "Gmail rate limit reached. Sync will retry later.", appError: new UpstreamServiceError("Gmail rate limit reached; try again later") };
+    return {
+      code: "rate_limited",
+      message: "Gmail rate limit reached. Progress was saved; sync will resume later.",
+      appError: new UpstreamServiceError("Gmail rate limit reached; progress saved, try again later"),
+    };
   }
   if (err instanceof MailboxError) {
-    return { code: err.kind, message: "Gmail is temporarily unavailable. Sync will retry later.", appError: new UpstreamServiceError("Gmail is temporarily unavailable; try again later") };
+    return {
+      code: err.kind,
+      message: "Gmail is temporarily unavailable. Progress was saved; sync will resume later.",
+      appError: new UpstreamServiceError("Gmail is temporarily unavailable; try again later"),
+    };
   }
   if (err instanceof LeaseLostError) {
     return { code: "lease_lost", message: "Sync was interrupted and will resume on the next run.", appError: new ConflictError("Sync was interrupted; try again") };
@@ -365,6 +468,8 @@ function safeFailure(err: unknown): { code: string; message: string; appError: A
 export async function syncGmailMailbox(auth: AuthContext, opts: GmailSyncOptions): Promise<GmailSyncResult> {
   requireRole(auth, "MEMBER");
   const actor = opts.trigger === "cron" ? "SYSTEM" : "USER";
+  const env = getEnv();
+  const clock = opts.clock ?? realClock;
   const integration = await findOwnGmailIntegration(auth);
   if (!integration) throw new NotFoundError("Gmail is not connected");
   if (integration.status === "REAUTH_REQUIRED") throw new PolicyViolationError("Gmail needs to be reconnected");
@@ -373,8 +478,10 @@ export async function syncGmailMailbox(auth: AuthContext, opts: GmailSyncOptions
   const lease = await claimLease(auth, integration.id);
   if (!lease) throw new ConflictError("A Gmail sync is already running for this mailbox");
 
-  const started = Date.now();
+  const started = clock.now();
   const cursorBefore = integration.syncCursor;
+  let backfillCursor = integration.backfillCursor;
+  const resumed = !cursorBefore && backfillCursor !== null;
   const logBase = {
     organizationId: auth.organizationId,
     mailboxUserId: auth.userId,
@@ -386,62 +493,80 @@ export async function syncGmailMailbox(auth: AuthContext, opts: GmailSyncOptions
     integrationId: integration.id,
     lease,
     mailboxAddress: integration.externalAccountId ?? "",
-    counters: { upserted: 0, deleted: 0, skipped: 0, threads: new Set() },
+    clock,
+    deadlineAt: opts.deadlineAt ?? started + env.GMAIL_SYNC_RUN_BUDGET_SECONDS * 1000,
+    fetchesRemaining: opts.maxMessageFetches ?? Number.POSITIVE_INFINITY,
+    counters: { upserted: 0, deleted: 0, skipped: 0, alreadySynced: 0, threads: new Set() },
   };
   let syncType: SyncType = cursorBefore ? "incremental" : "initial";
   await withOrgScope(auth, (tx) =>
-    recordAudit(tx, auth, { event: "gmail.sync_started", entityType: "integration", entityId: integration.id, metadata: { trigger: opts.trigger, syncType } }, { actor }),
+    recordAudit(tx, auth, { event: "gmail.sync_started", entityType: "integration", entityId: integration.id, metadata: { trigger: opts.trigger, syncType, resumed } }, { actor }),
   );
-  log.info("gmail.sync_started", { ...logBase, syncType, cursorBefore });
+  log.info("gmail.sync_started", { ...logBase, syncType, resumed, cursorBefore, backfillCursor });
+
+  const counts = () => ({
+    messagesUpserted: ctx.counters.upserted,
+    messagesDeleted: ctx.counters.deleted,
+    alreadySynced: ctx.counters.alreadySynced,
+    threadsTouched: ctx.counters.threads.size,
+    skipped: ctx.counters.skipped,
+  });
 
   try {
-    const source = opts.source ?? createGmailMailboxSource(auth, integration.id, { actor });
-    const lookbackDays = opts.lookbackDays ?? getEnv().GMAIL_SYNC_LOOKBACK_DAYS;
+    const source =
+      opts.source ?? createGmailMailboxSource(auth, integration.id, { actor, clock, unitsPerSecond: opts.unitsPerSecond });
+    const lookbackDays = opts.lookbackDays ?? env.GMAIL_SYNC_LOOKBACK_DAYS;
     const since = new Date((opts.now ?? new Date()).getTime() - lookbackDays * 86_400_000);
 
-    let cursorAfter: string;
+    let step: StepResult;
     if (!cursorBefore) {
-      cursorAfter = await backfill(ctx, source, since);
+      step = await backfill(ctx, source, since, backfillCursor);
     } else {
       try {
-        cursorAfter = await incremental(ctx, source, cursorBefore);
+        step = await incremental(ctx, source, cursorBefore);
       } catch (err) {
         if (!(err instanceof MailboxCursorExpiredError)) throw err;
         // Gmail no longer has history for our cursor. Do not pretend the
-        // incremental sync succeeded: record it, then rebuild a bounded baseline.
+        // incremental sync succeeded: drop the checkpoint, record it, and
+        // rebuild a bounded baseline (which may itself span several runs).
         syncType = "recovery";
         await withOrgScope(auth, async (tx) => {
-          await tx.integration.update({
-            where: { id: integration.id },
-            data: { lastError: "Gmail history expired; running a recovery sync." },
-          });
+          const n = await tx.$executeRaw`
+            UPDATE integrations
+               SET sync_cursor = NULL, backfill_cursor = NULL,
+                   last_error = 'Gmail history expired; running a recovery sync.', updated_at = now()
+             WHERE id = ${integration.id}::uuid AND sync_lease_expires_at = ${ctx.lease}`;
+          if (n === 0) throw new LeaseLostError();
           await recordAudit(tx, auth, { event: "gmail.resync_required", entityType: "integration", entityId: integration.id, metadata: { cursorBefore } }, { actor });
         });
-        log.warn("gmail.history_expired", { ...logBase, cursorBefore });
-        cursorAfter = await backfill(ctx, source, since);
+        log.warn("gmail.history_expired", { ...logBase, cursorBefore, ...err.diagnostics });
+        backfillCursor = null;
+        step = await backfill(ctx, source, since, null);
       }
     }
 
-    // Commit the checkpoint only if we still hold the lease.
+    const outcome: SyncOutcome = step.complete ? "completed" : "partial";
+    const cursorAfter = step.complete ? step.cursor : null;
+
+    // Commit only while we still hold the lease. A partial run releases the
+    // lease and clears errors but leaves the sync checkpoint untouched.
     const committed = await withOrgScope(auth, async (tx) => {
-      const n = await tx.$executeRaw`
-        UPDATE integrations
-           SET sync_cursor = ${cursorAfter}, last_synced_at = now(), last_error = NULL,
-               sync_lease_expires_at = NULL, updated_at = now()
-         WHERE id = ${integration.id}::uuid AND sync_lease_expires_at = ${ctx.lease}`;
+      const n = step.complete
+        ? await tx.$executeRaw`
+            UPDATE integrations
+               SET sync_cursor = ${cursorAfter}, backfill_cursor = NULL, last_synced_at = now(),
+                   last_error = NULL, sync_lease_expires_at = NULL, updated_at = now()
+             WHERE id = ${integration.id}::uuid AND sync_lease_expires_at = ${ctx.lease}`
+        : await tx.$executeRaw`
+            UPDATE integrations
+               SET last_error = NULL, sync_lease_expires_at = NULL, updated_at = now()
+             WHERE id = ${integration.id}::uuid AND sync_lease_expires_at = ${ctx.lease}`;
       if (n === 0) return false;
       await recordAudit(tx, auth, {
-        event: "gmail.sync_completed",
+        event: step.complete ? "gmail.sync_completed" : "gmail.sync_partial",
         entityType: "integration",
         entityId: integration.id,
-        metadata: {
-          trigger: opts.trigger,
-          syncType,
-          messagesUpserted: ctx.counters.upserted,
-          messagesDeleted: ctx.counters.deleted,
-          threadsTouched: ctx.counters.threads.size,
-          skipped: ctx.counters.skipped,
-        },
+        metadata: { trigger: opts.trigger, syncType, resumed, ...counts() },
       }, { actor });
       return true;
     });
@@ -450,21 +575,21 @@ export async function syncGmailMailbox(auth: AuthContext, opts: GmailSyncOptions
     const result: GmailSyncResult = {
       integrationId: integration.id,
       syncType,
+      outcome,
+      resumed,
       trigger: opts.trigger,
-      messagesUpserted: ctx.counters.upserted,
-      messagesDeleted: ctx.counters.deleted,
-      threadsTouched: ctx.counters.threads.size,
-      skipped: ctx.counters.skipped,
+      ...counts(),
       cursorBefore,
       cursorAfter,
-      durationMs: Date.now() - started,
+      durationMs: clock.now() - started,
     };
-    log.info("gmail.sync_completed", { ...logBase, ...result });
+    log.info(step.complete ? "gmail.sync_completed" : "gmail.sync_partial", { ...logBase, ...result });
     return result;
   } catch (err) {
     const failure = safeFailure(err);
     await withOrgScope(auth, async (tx) => {
-      // Release our lease and record a safe error. The cursor is untouched.
+      // Release our lease and record a safe error. Cursors are untouched, so
+      // a backfill in progress resumes from where it stopped.
       await tx.$executeRaw`
         UPDATE integrations
            SET sync_lease_expires_at = NULL, last_error = ${failure.message}, updated_at = now()
@@ -473,17 +598,25 @@ export async function syncGmailMailbox(auth: AuthContext, opts: GmailSyncOptions
         event: "gmail.sync_failed",
         entityType: "integration",
         entityId: integration.id,
-        metadata: { trigger: opts.trigger, syncType, errorCode: failure.code, messagesUpserted: ctx.counters.upserted },
+        metadata: {
+          trigger: opts.trigger,
+          syncType,
+          errorCode: failure.code,
+          ...(err instanceof MailboxError ? err.diagnostics : {}),
+          ...counts(),
+        },
       }, { actor });
     }).catch(() => undefined);
     log.error("gmail.sync_failed", {
       ...logBase,
       syncType,
+      resumed,
       cursorBefore,
       errorCode: failure.code,
       errorName: err instanceof Error ? err.name : typeof err,
-      messagesUpserted: ctx.counters.upserted,
-      durationMs: Date.now() - started,
+      ...(err instanceof MailboxError ? err.diagnostics : {}),
+      ...counts(),
+      durationMs: clock.now() - started,
     });
     throw failure.appError ?? err;
   }

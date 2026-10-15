@@ -150,6 +150,8 @@ Databases: `tracklibute_dev` (development) and `tracklibute_test` (tests only).
 | `GMAIL_REDIRECT_URI` | for Gmail | Must exactly match the Gmail redirect registered at Google |
 | `GMAIL_SYNC_CRON_SECRET` | for cron | ≥ 32 chars (`openssl rand -hex 32`) |
 | `GMAIL_SYNC_LOOKBACK_DAYS` | | Initial and recovery backfill window, 1–365 (default **90**) |
+| `GMAIL_QUOTA_UNITS_PER_SECOND` | | Gmail quota pacing per mailbox (default **80**; Google allows 100/s) |
+| `GMAIL_SYNC_RUN_BUDGET_SECONDS` | | Max seconds per sync run before ending as *partial* (default **210**) |
 | `DEV_AUTH_ENABLED` | | `true` enables dev login. Always refused when `NODE_ENV=production`. |
 
 Tests read `.env.test`: the same keys, pointing at `tracklibute_test`. Create it with
@@ -232,6 +234,7 @@ and the Gmail REST API, with failure injection.
 | `gmail-oauth` | Read-only PKCE auth URL, state/CSRF, session binding, scope enforcement, encrypted credentials, disconnect, revoked → reauth |
 | `gmail-adapter` | Listing, message, thread, history, parsing, MIME, retries/rate limits, token refresh, typed errors |
 | `gmail-sync` | 90-day and custom lookback, batching, incremental history, deletions, idempotency, failure keeps cursor, history-expiry recovery, concurrency lease |
+| `gmail-sync-resume` | Pacing under the emulated 6,000-units/min quota (zero 429s), exponential backoff recovery, partial vs failed outcomes, resume without re-fetch, original-checkpoint correctness across runs, deadline time-box, sibling cancellation, diagnostics |
 | `email-isolation` | Org A vs B **and** member vs member in one org, at app and RLS layers. URL/body tampering, composite FKs, cron secret, member removal. |
 | `security` | No tokens, codes or bodies in responses, logs or audit. RLS on every table. Composite FKs. Email content triggers nothing. |
 | Foundation suites | Tenancy, approval gate, API, integrations, units |
@@ -240,36 +243,70 @@ and the Gmail REST API, with failure injection.
 
 ## Gmail sync behavior
 
-- **Initial sync:** messages newer than `GMAIL_SYNC_LOOKBACK_DAYS` (default 90),
-  listed in pages of 100 and fetched with concurrency 5. The checkpoint is the
-  mailbox `historyId`, captured **before** the backfill, so concurrent changes
-  are picked up next time.
-- **Incremental sync:** Gmail History API since the stored checkpoint. Added and
-  relabelled messages are re-fetched. Deleted, trashed or spammed messages are
-  removed locally, and empty threads are dropped.
-- **Checkpoint safety:** the cursor is committed only after every change is
-  processed, and only while the run still holds its lease. A failed run leaves
-  the old cursor, so a rerun is safe because all writes are idempotent:
-  - unique `(integrationId, externalMessageId)` for messages
-  - unique `(integrationId, externalThreadId)` for threads
-- **Expired history:** when Gmail returns 404 for the cursor, Tracklibute:
-  - records `gmail.resync_required` and a `lastError`
-  - runs a **bounded recovery backfill** over the lookback window
-  - sets a fresh cursor
+Google's limits (Usage limits page, updated 2026-09-10):
 
-  It never reports a failed incremental sync as successful.
+- **Per-user quota:** 6,000 units per minute.
+- **`messages.get` costs 20 units.** A mailbox can therefore fetch at most
+  about **300 messages per minute**.
+- **The sync is designed around that ceiling.** A large initial backfill
+  spans several runs.
+
+- **Pacing:** a shared quota pacer spends at most `GMAIL_QUOTA_UNITS_PER_SECOND`
+  per run (default **80 units/s**, about 4 messages/s and 240/minute) with
+  **2** concurrent workers.
+- **Backoff:** rate limits (429, or a rate-limit 403) back off exponentially:
+  1, 2, 4, 8, 16 s, capped at 32 s, plus up to 1 s of jitter, for up to 5
+  retries. `Retry-After` is honoured, and the pacer pauses so **every** worker
+  waits. 5xx errors get a short backoff with 3 retries. When one worker fails
+  fatally, sibling workers stop and in-flight calls settle before the run ends.
+- **Time-boxed runs:** each run gets `GMAIL_SYNC_RUN_BUDGET_SECONDS` (default
+  **210 s**). Workers stop picking up messages at the deadline. The cron
+  shares one 250 s budget across mailboxes.
+- **Resumable initial backfill:**
+  - It covers messages newer than `GMAIL_SYNC_LOOKBACK_DAYS` (default 90).
+  - On the first run, the mailbox `historyId` is stored as `backfill_cursor`.
+  - Every run skips messages already stored, so re-runs **resume** rather
+    than restart.
+  - When the backfill completes, `sync_cursor` ← `backfill_cursor`, the
+    checkpoint from when the backfill *started*. Deletions and label changes
+    made during a multi-run backfill are then replayed by the first
+    incremental sync.
+- **Partial vs failed runs:**
+
+  | Outcome | Cause | Effect |
+  |---|---|---|
+  | **Partial** | The budget ran out | Lease released, no error recorded. UI shows "initial sync in progress (continues automatically)", audit `gmail.sync_partial`. |
+  | **Failed** | Rate-limit retries exhausted, Gmail unavailable, or access revoked | `lastError` and `gmail.sync_failed` recorded. Stored progress and `backfill_cursor` are kept, so the next run resumes. |
+
+- **Incremental sync:** Gmail History API since `sync_cursor`. Added or
+  relabelled messages are re-fetched. Deleted, trashed or spammed messages are
+  removed, and empty threads are dropped. If a run is time-boxed, the cursor
+  isn't advanced and the next run replays the changes idempotently.
+- **Checkpoint safety:** `sync_cursor` is committed only by a **complete** run
+  that still holds its lease (compare-and-set). All writes are idempotent:
+  - messages: unique `(integrationId, externalMessageId)`
+  - threads: unique `(integrationId, externalThreadId)`
+- **Expired history:** if Gmail returns 404 for the cursor, Tracklibute:
+  - records `gmail.resync_required`
+  - clears both cursors
+  - starts a bounded recovery backfill, which can itself span runs
+
+  A failed incremental sync is never reported as a success.
 - **Concurrency:** a single-row lease (`syncLeaseExpiresAt`, 10 min, extended
   per batch) admits one run per mailbox. A crashed run's lease expires and is
   reclaimable.
+- **Diagnostics:** rate-limit retries and failures log the Gmail `endpoint`,
+  `httpStatus` and Google's `providerReason`. These are non-secret and never
+  include tokens or content.
 - **Tokens:**
   - Access tokens refresh 60 s before expiry; a 401 forces one refresh.
   - If Google rejects the refresh (`invalid_grant`), the integration becomes
-    `REAUTH_REQUIRED`. The row and data are kept, and the user must reconnect.
+    `REAUTH_REQUIRED`. The row and data are kept.
 - **Not ingested:** drafts, spam, trash and chat. Only allow-listed system
   labels and headers are stored.
 - **Bodies:** `text/plain` is preferred, with HTML converted to plain text as a
-  fallback. Whitespace is normalized and the body is capped at **50,000 chars**
-  (`bodyTruncated` is set when the cap applies). There's no AI and no summarization.
+  fallback. Whitespace is normalized and the body is capped at **50,000 chars**.
+  There's no AI and no summarization.
 
 ---
 
@@ -351,12 +388,21 @@ PostgreSQL. Create a `tracklibute_app` role without `BYPASSRLS` before running
 
 ## Known limitations
 
-- **Initial backfill runs within a single request.** It's batched and leased,
-  but very large mailboxes may exceed serverless time limits. Pagination
-  progress isn't checkpointed, so the next run restarts the backfill
-  (idempotently) until it completes once.
-- **The cron processes up to 10 mailboxes per call, sequentially.** Schedule it
-  at a frequency that fits your mailbox count.
+- **Initial backfill throughput is bounded by Google's quota.** It runs at
+  about 240 messages per minute per mailbox. A mailbox with 3,000 messages in
+  90 days needs about 13 minutes of sync time, spread over several runs (cron
+  or Sync now).
+- **Resumed runs re-list pages.** Each page costs 5 units, and stored messages
+  are skipped, not re-fetched.
+- **Messages already stored by an earlier backfill run aren't re-fetched**
+  before the backfill completes. Their label changes are applied by the first
+  incremental sync.
+- **The cron processes up to 10 mailboxes per call, sequentially, within one
+  250 s budget.** Schedule it often enough for your mailbox count; mailboxes it
+  doesn't reach stay eligible.
+- **Some non-rate-limit 403s are reported as "reconnect required".** This
+  includes a disabled Gmail API, so check that the API is enabled in Google
+  Cloud. Finer classification is a follow-up.
 - **One organization per user, no invitations.** Sign-in binds the user's
   earliest membership.
 - **`send-as` aliases aren't known.** Messages sent from an alias are marked `UNKNOWN`.

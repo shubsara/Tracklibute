@@ -82,32 +82,40 @@ export interface MailboxSource {
 
 // ─── Provider-neutral failure modes ─────────────────────────────────────────
 
+/** Non-secret diagnostics for logs: which call failed and how. Never tokens or content. */
+export interface MailboxErrorDiagnostics {
+  readonly endpoint?: string;
+  readonly httpStatus?: number;
+  readonly providerReason?: string | null;
+}
+
 export class MailboxError extends Error {
   constructor(
     message: string,
     readonly kind: "cursor_expired" | "authorization_revoked" | "rate_limited" | "unavailable" | "invalid_response",
+    readonly diagnostics: MailboxErrorDiagnostics = {},
   ) {
     super(message);
     this.name = new.target.name;
   }
 }
 export class MailboxCursorExpiredError extends MailboxError {
-  constructor() {
-    super("Mailbox change history is no longer available for the stored cursor", "cursor_expired");
+  constructor(diagnostics: MailboxErrorDiagnostics = {}) {
+    super("Mailbox change history is no longer available for the stored cursor", "cursor_expired", diagnostics);
   }
 }
 export class MailboxAuthorizationRevokedError extends MailboxError {
-  constructor() {
-    super("Mailbox authorization was revoked or expired; the user must reconnect", "authorization_revoked");
+  constructor(diagnostics: MailboxErrorDiagnostics = {}) {
+    super("Mailbox authorization was revoked or expired; the user must reconnect", "authorization_revoked", diagnostics);
   }
 }
 export class MailboxRateLimitedError extends MailboxError {
-  constructor() {
-    super("Mailbox provider rate limit reached; retry later", "rate_limited");
+  constructor(diagnostics: MailboxErrorDiagnostics = {}) {
+    super("Mailbox provider rate limit reached; retry later", "rate_limited", diagnostics);
   }
 }
 export class MailboxUnavailableError extends MailboxError {
-  constructor(detail = "Mailbox provider is temporarily unavailable") {
-    super(detail, "unavailable");
+  constructor(detail = "Mailbox provider is temporarily unavailable", diagnostics: MailboxErrorDiagnostics = {}) {
+    super(detail, "unavailable", diagnostics);
   }
 }
