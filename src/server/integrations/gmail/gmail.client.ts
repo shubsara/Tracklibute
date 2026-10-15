@@ -47,6 +47,8 @@ export type GmailErrorKind =
   | "transient"
   | "not_found"
   | "history_expired"
+  | "api_disabled"
+  | "insufficient_scope"
   | "forbidden"
   | "bad_request";
 
@@ -112,6 +114,10 @@ export interface GmailClientOptions {
 }
 
 const RATE_LIMIT_REASONS = new Set(["rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded", "RESOURCE_EXHAUSTED"]);
+/** Gmail API not enabled for the Google Cloud project — an admin/config problem, not the user's grant. */
+const API_DISABLED_REASONS = new Set(["accessNotConfigured", "SERVICE_DISABLED"]);
+/** The token lacks the required scope — the user must re-consent. */
+const INSUFFICIENT_SCOPE_REASONS = new Set(["insufficientPermissions", "ACCESS_TOKEN_SCOPE_INSUFFICIENT"]);
 const RATE_LIMIT_MAX_BACKOFF_MS = 32_000;
 const RETRY_AFTER_MAX_MS = 64_000;
 
@@ -214,7 +220,12 @@ export class GmailClient {
 
       if (res.ok) return (await res.json()) as T;
 
-      const reason = await readReason(res);
+      const reasons = await readReasons(res);
+      // The most specific known reason wins; otherwise the first one Google sent.
+      const reason =
+        reasons.find((r) => RATE_LIMIT_REASONS.has(r) || API_DISABLED_REASONS.has(r) || INSUFFICIENT_SCOPE_REASONS.has(r)) ??
+        reasons[0] ??
+        null;
       if (res.status === 401) {
         if (!refreshed) {
           refreshed = true;
@@ -247,7 +258,11 @@ export class GmailClient {
         continue;
       }
       if (res.status === 404) throw new GmailApiError(opts.notFoundKind ?? "not_found", 404, reason, endpoint);
-      if (res.status === 403) throw new GmailApiError("forbidden", 403, reason, endpoint);
+      if (res.status === 403) {
+        if (reason && API_DISABLED_REASONS.has(reason)) throw new GmailApiError("api_disabled", 403, reason, endpoint);
+        if (reason && INSUFFICIENT_SCOPE_REASONS.has(reason)) throw new GmailApiError("insufficient_scope", 403, reason, endpoint);
+        throw new GmailApiError("forbidden", 403, reason, endpoint);
+      }
       throw new GmailApiError("bad_request", res.status, reason, endpoint);
     }
   }
@@ -260,17 +275,34 @@ function retryAfterMs(res: Response): number | null {
   return Number.isFinite(secs) ? Math.min(RETRY_AFTER_MAX_MS, Math.max(0, secs * 1000)) : null;
 }
 
-/** Google's machine-readable reason code only (e.g. "rateLimitExceeded") — never the message text. */
-async function readReason(res: Response): Promise<string | null> {
+/**
+ * Google's machine-readable reason codes only (e.g. "accessNotConfigured",
+ * "SERVICE_DISABLED") from errors[].reason, details[].reason and status —
+ * never message text, which can echo request data.
+ */
+async function readReasons(res: Response): Promise<string[]> {
   try {
-    const body = (await res.json()) as GmailErrorBody;
-    const reason = body.error?.errors?.[0]?.reason ?? body.error?.status ?? null;
-    return reason && /^[A-Za-z_]{1,64}$/.test(reason) ? reason : null;
+    const e = ((await res.json()) as GmailErrorBody).error;
+    const all = [
+      ...(e?.errors ?? []).map((x) => x?.reason),
+      ...(e?.details ?? []).map((x) => x?.reason),
+      e?.status,
+    ];
+    return all.filter((r): r is string => typeof r === "string" && /^[A-Za-z_]{1,64}$/.test(r));
   } catch {
-    return null;
+    return [];
   }
 }
 
+/**
+ * Transport-level failures only (fetch rejected). Errors raised by our own
+ * token provider (e.g. a revoked grant) must never be retried as "network"
+ * errors — note "reconnect" contains "econn", so match exact Node codes.
+ */
+const NETWORK_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "EAI_AGAIN", "ENOTFOUND", "UND_ERR_SOCKET"]);
 function isNetworkError(err: unknown): boolean {
-  return err instanceof TypeError || (err instanceof Error && /fetch failed|ECONN|ETIMEDOUT|socket/i.test(err.message));
+  if (!(err instanceof Error)) return false;
+  const code = (err as { code?: unknown }).code ?? (err.cause as { code?: unknown } | undefined)?.code;
+  if (typeof code === "string" && NETWORK_CODES.has(code)) return true;
+  return err instanceof TypeError && /^fetch failed$/i.test(err.message);
 }

@@ -400,9 +400,15 @@ PostgreSQL. Create a `tracklibute_app` role without `BYPASSRLS` before running
 - **The cron processes up to 10 mailboxes per call, sequentially, within one
   250 s budget.** Schedule it often enough for your mailbox count; mailboxes it
   doesn't reach stay eligible.
-- **Some non-rate-limit 403s are reported as "reconnect required".** This
-  includes a disabled Gmail API, so check that the API is enabled in Google
-  Cloud. Finer classification is a follow-up.
+- **Gmail 403s are classified by Google's reason code:**
+  - `accessNotConfigured` / `SERVICE_DISABLED` → *API disabled*. The
+    integration stays CONNECTED, the error tells an admin to enable the Gmail
+    API, and sync resumes once it's enabled.
+  - `insufficientPermissions` / `ACCESS_TOKEN_SCOPE_INSUFFICIENT` →
+    *reconnect required*.
+  - Any other 403 → *access denied*: stays CONNECTED and is retried later.
+  - Only a revoked or invalid grant, a persistent 401, or a missing scope sets
+    `REAUTH_REQUIRED`.
 - **One organization per user, no invitations.** Sign-in binds the user's
   earliest membership.
 - **`send-as` aliases aren't known.** Messages sent from an alias are marked `UNKNOWN`.

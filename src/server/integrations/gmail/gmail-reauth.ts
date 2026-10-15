@@ -16,14 +16,16 @@ export async function markGmailReauthRequired(
   opts: { actor?: "USER" | "SYSTEM" } = {},
 ): Promise<void> {
   await withOrgScope(auth, async (tx) => {
-    await tx.integration.updateMany({
-      where: { id: integrationId, organizationId: auth.organizationId, ownerUserId: auth.userId },
+    // Idempotent: only a CONNECTED → REAUTH_REQUIRED transition is audited.
+    const { count } = await tx.integration.updateMany({
+      where: { id: integrationId, organizationId: auth.organizationId, ownerUserId: auth.userId, status: "CONNECTED" },
       data: {
         status: "REAUTH_REQUIRED",
         lastError: "Google access was revoked or expired. Reconnect Gmail to resume syncing.",
         syncLeaseExpiresAt: null,
       },
     });
+    if (count === 0) return;
     for (const event of ["gmail.token_refresh_failed", "gmail.reauth_required"]) {
       await recordAudit(tx, auth, { event, entityType: "integration", entityId: integrationId }, opts);
     }

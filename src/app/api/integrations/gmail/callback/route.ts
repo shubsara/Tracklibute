@@ -1,6 +1,7 @@
 import { after } from "next/server";
 
 import { log } from "@/lib/log";
+import { MailboxError } from "@/domain/email/types";
 import { AppError } from "@/lib/errors";
 import { classifyOAuthError } from "@/server/auth/google-oidc";
 import { clearOAuthTransactionCookie, readOAuthTransaction } from "@/server/auth/oauth-state";
@@ -53,7 +54,18 @@ export async function GET(request: Request): Promise<Response> {
     return redirect(`${SETTINGS}?gmail=connected`, 303, [clearTx]);
   } catch (err) {
     const reason = err instanceof AppError ? err.code : classifyOAuthError(err);
-    log.warn("gmail.connect_failed", { organizationId: auth.organizationId, mailboxUserId: auth.userId, reason });
-    return redirect(`${SETTINGS}?gmail=connect_failed`, 303, [clearTx]);
+    const diagnostics = err instanceof MailboxError ? err.diagnostics : {};
+    log.warn("gmail.connect_failed", { organizationId: auth.organizationId, mailboxUserId: auth.userId, reason, ...diagnostics });
+    // Specific, actionable outcomes; nothing was stored for a failed connect.
+    const outcome =
+      err instanceof MailboxError && err.kind === "provider_misconfigured"
+        ? "api_disabled"
+        : err instanceof MailboxError &&
+            err.kind === "authorization_revoked" &&
+            (diagnostics.providerReason === "insufficientPermissions" ||
+              diagnostics.providerReason === "ACCESS_TOKEN_SCOPE_INSUFFICIENT")
+          ? "insufficient_scope"
+          : "connect_failed";
+    return redirect(`${SETTINGS}?gmail=${outcome}`, 303, [clearTx]);
   }
 }

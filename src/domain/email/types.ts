@@ -92,7 +92,14 @@ export interface MailboxErrorDiagnostics {
 export class MailboxError extends Error {
   constructor(
     message: string,
-    readonly kind: "cursor_expired" | "authorization_revoked" | "rate_limited" | "unavailable" | "invalid_response",
+    readonly kind:
+      | "cursor_expired"
+      | "authorization_revoked"
+      | "provider_misconfigured"
+      | "access_denied"
+      | "rate_limited"
+      | "unavailable"
+      | "invalid_response",
     readonly diagnostics: MailboxErrorDiagnostics = {},
   ) {
     super(message);
@@ -107,6 +114,22 @@ export class MailboxCursorExpiredError extends MailboxError {
 export class MailboxAuthorizationRevokedError extends MailboxError {
   constructor(diagnostics: MailboxErrorDiagnostics = {}) {
     super("Mailbox authorization was revoked or expired; the user must reconnect", "authorization_revoked", diagnostics);
+  }
+}
+/**
+ * The provider rejects the integration's configuration, not the user's grant
+ * (e.g. the Gmail API is not enabled for the Cloud project). Reconnecting
+ * does not help; an administrator must fix it.
+ */
+export class MailboxProviderMisconfiguredError extends MailboxError {
+  constructor(diagnostics: MailboxErrorDiagnostics = {}) {
+    super("The mail provider API is not enabled for this application", "provider_misconfigured", diagnostics);
+  }
+}
+/** Access refused for a reason that is neither revocation nor misconfiguration (e.g. account/domain policy). */
+export class MailboxAccessDeniedError extends MailboxError {
+  constructor(diagnostics: MailboxErrorDiagnostics = {}) {
+    super("The mail provider denied access to this mailbox", "access_denied", diagnostics);
   }
 }
 export class MailboxRateLimitedError extends MailboxError {

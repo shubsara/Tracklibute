@@ -72,5 +72,10 @@ export interface GmailProfile {
 }
 
 export interface GmailErrorBody {
-  error?: { code?: number; status?: string; errors?: Array<{ reason?: string }> };
+  error?: {
+    code?: number;
+    status?: string;
+    errors?: Array<{ reason?: string }>;
+    details?: Array<{ reason?: string }>;
+  };
 }

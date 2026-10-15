@@ -10,6 +10,8 @@ const NOTICES: Record<string, string> = {
   consent_denied: "Gmail access was not granted.",
   invalid_state: "The Gmail connection request expired. Please try again.",
   connect_failed: "We couldn't connect Gmail. Please try again.",
+  api_disabled: "Gmail couldn't be connected: the Gmail API is not enabled for this app's Google Cloud project. An administrator must enable it, then connect again.",
+  insufficient_scope: "Gmail read access wasn't fully granted. Please connect again and allow read-only access.",
 };
 
 const fmt = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : "never");

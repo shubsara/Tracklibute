@@ -3,7 +3,9 @@ import "server-only";
 import type { AuthContext } from "@/domain/auth/auth-context";
 import {
   type MailboxChangePage,
+  MailboxAccessDeniedError,
   MailboxAuthorizationRevokedError,
+  MailboxProviderMisconfiguredError,
   MailboxCursorExpiredError,
   MailboxError,
   MailboxRateLimitedError,
@@ -49,9 +51,14 @@ function toMailboxError(err: unknown): unknown {
   switch (err.kind) {
     case "history_expired":
       return new MailboxCursorExpiredError(d);
+    // Only a genuinely invalid grant or a missing scope means "reconnect".
     case "unauthorized":
-    case "forbidden":
+    case "insufficient_scope":
       return new MailboxAuthorizationRevokedError(d);
+    case "api_disabled":
+      return new MailboxProviderMisconfiguredError(d);
+    case "forbidden":
+      return new MailboxAccessDeniedError(d);
     case "rate_limited":
       return new MailboxRateLimitedError(d);
     case "transient":

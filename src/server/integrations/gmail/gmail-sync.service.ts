@@ -13,7 +13,14 @@ import {
   type NormalizedEmailMessage,
 } from "@/domain/email/types";
 import { getEnv } from "@/lib/env";
-import { AppError, ConflictError, NotFoundError, PolicyViolationError, UpstreamServiceError } from "@/lib/errors";
+import {
+  AppError,
+  ConflictError,
+  NotFoundError,
+  PolicyViolationError,
+  ServiceUnavailableError,
+  UpstreamServiceError,
+} from "@/lib/errors";
 import { log } from "@/lib/log";
 import { recordAudit } from "@/server/audit/audit-log";
 import { type Tx, withOrgScope } from "@/server/db/org-scope";
@@ -437,6 +444,20 @@ async function incremental(ctx: SyncCtx, source: MailboxSource, cursor: string):
 // ─── Public entry point ─────────────────────────────────────────────────────
 
 function safeFailure(err: unknown): { code: string; message: string; appError: AppError | null } {
+  if (err instanceof MailboxError && err.kind === "provider_misconfigured") {
+    return {
+      code: "gmail_api_disabled",
+      message: "The Gmail API is not enabled for this app's Google Cloud project. An administrator must enable it; sync will resume afterwards.",
+      appError: new ServiceUnavailableError("The Gmail API is not enabled for this Google Cloud project"),
+    };
+  }
+  if (err instanceof MailboxError && err.kind === "access_denied") {
+    return {
+      code: "gmail_access_denied",
+      message: "Gmail denied access to this mailbox. Progress was saved; sync will retry later.",
+      appError: new UpstreamServiceError("Gmail denied access to this mailbox; try again later"),
+    };
+  }
   if (err instanceof MailboxAuthorizationRevokedError) {
     return {
       code: "reauth_required",
@@ -594,6 +615,23 @@ export async function syncGmailMailbox(auth: AuthContext, opts: GmailSyncOptions
         UPDATE integrations
            SET sync_lease_expires_at = NULL, last_error = ${failure.message}, updated_at = now()
          WHERE id = ${integration.id}::uuid AND sync_lease_expires_at = ${ctx.lease}`;
+      // Only a genuinely invalid grant / missing scope requires reconnecting.
+      // API-disabled, access-denied, rate-limit and outage errors leave the
+      // integration CONNECTED so it resumes once the cause is fixed. (A failed
+      // token refresh has already flagged REAUTH_REQUIRED; don't double-audit.)
+      if (err instanceof MailboxAuthorizationRevokedError) {
+        const flagged = await tx.$executeRaw`
+          UPDATE integrations SET status = 'REAUTH_REQUIRED', sync_lease_expires_at = NULL, updated_at = now()
+           WHERE id = ${integration.id}::uuid AND status = 'CONNECTED'`;
+        if (flagged > 0) {
+          await recordAudit(tx, auth, {
+            event: "gmail.reauth_required",
+            entityType: "integration",
+            entityId: integration.id,
+            metadata: { ...err.diagnostics },
+          }, { actor });
+        }
+      }
       await recordAudit(tx, auth, {
         event: "gmail.sync_failed",
         entityType: "integration",
