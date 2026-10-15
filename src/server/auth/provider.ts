@@ -4,20 +4,24 @@ import "server-only";
  * Pluggable authentication provider.
  *
  * A provider answers exactly one question: "which user is this, and which
- * organization did the server previously bind this session to?" It does NOT
- * decide roles or permissions — membership is re-verified against the
- * database on every request in `resolveAuthContext`.
+ * organization did the server bind this session to?" It does NOT decide roles
+ * or permissions — membership is re-verified against the database on every
+ * request in `resolveAuthContext`.
  *
- * Foundation ships a development provider. The production provider
- * (Auth.js / Clerk / WorkOS / ...) is chosen in a later spec and only has to
- * implement this interface.
+ * Providers (tried in order):
+ *  - `session` — database-backed opaque sessions created after Google sign-in
+ *  - `dev`     — signed dev tokens; local development and tests only
  */
 export interface SessionIdentity {
+  readonly provider: "session" | "dev";
   readonly userId: string;
-  readonly organizationId: string;
+  /** Null until the user has created / been bound to an organization. */
+  readonly organizationId: string | null;
+  /** HMAC of the opaque session token (session provider only). */
+  readonly sessionTokenHash?: string;
 }
 
 export interface AuthProvider {
-  readonly name: string;
+  readonly name: SessionIdentity["provider"];
   authenticate(headers: Headers): Promise<SessionIdentity | null>;
 }

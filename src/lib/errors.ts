@@ -53,3 +53,15 @@ export class PolicyViolationError extends AppError {
   readonly status = 422;
   readonly code = "policy_violation";
 }
+
+/** A required external configuration (e.g. Google OAuth client) is missing. */
+export class ServiceUnavailableError extends AppError {
+  readonly status = 503;
+  readonly code = "service_unavailable";
+}
+
+/** An upstream provider failed in a way the caller may retry later. */
+export class UpstreamServiceError extends AppError {
+  readonly status = 502;
+  readonly code = "upstream_error";
+}

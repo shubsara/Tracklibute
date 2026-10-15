@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import { ValidationError } from "@/lib/errors";
 import { devLogin } from "@/server/auth/dev-login";
-import { SESSION_COOKIE } from "@/server/auth/dev-provider";
+import { DEV_SESSION_COOKIE } from "@/server/auth/dev-provider";
 import { errorResponse, json } from "@/server/http/route";
 
 export const dynamic = "force-dynamic";
@@ -14,7 +14,7 @@ const loginSchema = z.object({
 
 function sessionCookie(value: string, maxAge: number): string {
   const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
-  return `${SESSION_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`;
+  return `${DEV_SESSION_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`;
 }
 
 /**

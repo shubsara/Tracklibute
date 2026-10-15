@@ -16,6 +16,8 @@ export default defineConfig({
     setupFiles: ["tests/support/load-env.ts"],
     // DB-backed tests share one Postgres; keep files serial for deterministic output.
     fileParallelism: false,
+    // Structured logs are printed only for failing tests.
+    silent: "passed-only",
     testTimeout: 20_000,
     hookTimeout: 60_000,
   },

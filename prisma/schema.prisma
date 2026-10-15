@@ -26,6 +26,7 @@ model Organization {
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   members            OrganizationMember[]
+  sessions           Session[]
   integrations       Integration[]
   responsibilities   Responsibility[]
   responsibilityRuns ResponsibilityRun[]
@@ -38,13 +39,16 @@ model Organization {
 }
 
 model User {
-  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  email     String   @unique
-  name      String?
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email         String   @unique
+  name          String?
+  // Stable Google account identifier (OIDC `sub`). Identity is keyed on this, not on email.
+  googleSubject String?  @unique @map("google_subject")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   memberships OrganizationMember[]
+  sessions    Session[]
 
   @@map("users")
 }
@@ -66,15 +70,36 @@ model OrganizationMember {
   createdAt      DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt      DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization       Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user               User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ownedIntegrations  Integration[] @relation("IntegrationOwner")
 
   @@unique([organizationId, userId])
   @@index([userId])
   @@map("organization_members")
 }
 
-// ─── Integrations (abstraction only — no OAuth / sync in Foundation) ───────
+// Database-backed opaque sessions. The client holds a random token; only its
+// HMAC is stored. Reachable by the app role exclusively through SECURITY
+// DEFINER auth_* functions (no table grants).
+model Session {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tokenHash      String    @unique @map("token_hash")
+  userId         String    @map("user_id") @db.Uuid
+  // Null until the user creates (or is bound to) an organization.
+  organizationId String?   @map("organization_id") @db.Uuid
+  expiresAt      DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt      DateTime? @map("revoked_at") @db.Timestamptz(3)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+// ─── Integrations ──────────────────────────────────────────────────────────
 
 enum IntegrationProvider {
   GMAIL
@@ -88,6 +113,7 @@ enum IntegrationStatus {
   PENDING
   CONNECTED
   ERROR
+  REAUTH_REQUIRED
   DISCONNECTED
 
   @@map("integration_status")
@@ -104,14 +130,28 @@ model Integration {
   // AES-256-GCM envelope. Never selected into client-facing DTOs.
   encryptedCredentials String?             @map("encrypted_credentials")
   connectedByUserId    String?             @map("connected_by_user_id") @db.Uuid
+  // Set for user-scoped integrations (a personal mailbox). Null for org-wide
+  // integrations (e.g. a CRM portal). Removing the member removes the mailbox.
+  ownerUserId          String?             @map("owner_user_id") @db.Uuid
+  tokenExpiresAt       DateTime?           @map("token_expires_at") @db.Timestamptz(3)
+  lastSyncAttemptAt    DateTime?           @map("last_sync_attempt_at") @db.Timestamptz(3)
   lastSyncedAt         DateTime?           @map("last_synced_at") @db.Timestamptz(3)
+  // Provider sync checkpoint (Gmail historyId). Advanced only after a successful sync.
+  syncCursor           String?             @map("sync_cursor")
+  // Concurrency lease: a sync may run only while it holds an unexpired lease.
+  syncLeaseExpiresAt   DateTime?           @map("sync_lease_expires_at") @db.Timestamptz(3)
   lastError            String?             @map("last_error")
   createdAt            DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt            DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organization  Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  owner         OrganizationMember? @relation("IntegrationOwner", fields: [organizationId, ownerUserId], references: [organizationId, userId], onDelete: Cascade)
+  emailThreads  EmailThread[]
+  emailMessages EmailMessage[]
 
   @@unique([organizationId, provider, externalAccountId])
+  @@unique([organizationId, provider, ownerUserId])
+  @@unique([organizationId, id, ownerUserId])
   @@index([organizationId, provider])
   @@map("integrations")
 }
@@ -331,4 +371,101 @@ model AuditLog {
   @@index([organizationId, createdAt])
   @@index([organizationId, entityType, entityId])
   @@map("audit_logs")
+}
+
+// ─── Normalized email context (owner-private) ──────────────────────────────
+//
+// Provider-neutral representation of synced mail. Gmail ids are stored only
+// as external identifiers. Every row carries (organization_id,
+// mailbox_user_id); RLS restricts all four tables to the mailbox owner.
+
+enum EmailDirection {
+  INBOUND
+  OUTBOUND
+  UNKNOWN
+
+  @@map("email_direction")
+}
+
+enum EmailRecipientKind {
+  TO
+  CC
+  BCC
+
+  @@map("email_recipient_kind")
+}
+
+model EmailThread {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId   String   @map("organization_id") @db.Uuid
+  mailboxUserId    String   @map("mailbox_user_id") @db.Uuid
+  integrationId    String   @map("integration_id") @db.Uuid
+  externalThreadId String   @map("external_thread_id")
+  subject          String?
+  firstMessageAt   DateTime @map("first_message_at") @db.Timestamptz(3)
+  lastMessageAt    DateTime @map("last_message_at") @db.Timestamptz(3)
+  messageCount     Int      @default(0) @map("message_count")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  // Composite FK guarantees the thread's owner IS the integration's owner.
+  integration Integration    @relation(fields: [organizationId, integrationId, mailboxUserId], references: [organizationId, id, ownerUserId], onDelete: Cascade, map: "email_threads_integration_owner_fkey")
+  messages    EmailMessage[]
+
+  @@unique([integrationId, externalThreadId])
+  @@unique([organizationId, integrationId, mailboxUserId, id])
+  @@index([organizationId, mailboxUserId, lastMessageAt(sort: Desc), id])
+  @@map("email_threads")
+}
+
+model EmailMessage {
+  id                String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId    String         @map("organization_id") @db.Uuid
+  mailboxUserId     String         @map("mailbox_user_id") @db.Uuid
+  integrationId     String         @map("integration_id") @db.Uuid
+  threadId          String         @map("thread_id") @db.Uuid
+  externalMessageId String         @map("external_message_id")
+  externalThreadId  String         @map("external_thread_id")
+  fromEmail         String?        @map("from_email")
+  fromName          String?        @map("from_name")
+  subject           String?
+  snippet           String?
+  // Normalized plain text, capped (see EMAIL_BODY_MAX_CHARS). Untrusted content.
+  bodyText          String?        @map("body_text")
+  bodyTruncated     Boolean        @default(false) @map("body_truncated")
+  sentAt            DateTime?      @map("sent_at") @db.Timestamptz(3)
+  receivedAt        DateTime       @map("received_at") @db.Timestamptz(3)
+  direction         EmailDirection
+  // Allow-listed system labels only (INBOX, SENT, IMPORTANT, ...).
+  labels            String[]       @default([])
+  // Allow-listed normalized header metadata (message-id, in-reply-to, list-id, ...).
+  headers           Json?
+  createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  integration Integration             @relation(fields: [organizationId, integrationId, mailboxUserId], references: [organizationId, id, ownerUserId], onDelete: Cascade, map: "email_messages_integration_owner_fkey")
+  thread      EmailThread             @relation(fields: [organizationId, integrationId, mailboxUserId, threadId], references: [organizationId, integrationId, mailboxUserId, id], onDelete: Cascade, map: "email_messages_thread_owner_fkey")
+  recipients  EmailMessageRecipient[]
+
+  @@unique([integrationId, externalMessageId])
+  @@unique([organizationId, mailboxUserId, id])
+  @@index([threadId, receivedAt])
+  @@index([organizationId, mailboxUserId, receivedAt])
+  @@map("email_messages")
+}
+
+model EmailMessageRecipient {
+  organizationId String             @map("organization_id") @db.Uuid
+  mailboxUserId  String             @map("mailbox_user_id") @db.Uuid
+  messageId      String             @map("message_id") @db.Uuid
+  kind           EmailRecipientKind
+  // Lowercased address; the comparison key.
+  email          String
+  name           String?
+
+  message EmailMessage @relation(fields: [organizationId, mailboxUserId, messageId], references: [organizationId, mailboxUserId, id], onDelete: Cascade)
+
+  @@id([messageId, kind, email])
+  @@index([organizationId, mailboxUserId, email])
+  @@map("email_message_recipients")
 }

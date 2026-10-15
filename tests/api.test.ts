@@ -17,7 +17,7 @@ let A: OrgFixture;
 let B: OrgFixture;
 
 const bearer = (auth: Pick<AuthContext, "userId" | "organizationId">) =>
-  `Bearer ${issueSessionToken(auth, getEnv().AUTH_SESSION_SECRET)}`;
+  `Bearer ${issueSessionToken(auth, getEnv().SESSION_SECRET)}`;
 
 const req = (path: string, init: RequestInit & { auth?: AuthContext } = {}) => {
   const headers = new Headers(init.headers);
@@ -158,7 +158,7 @@ describe("development session endpoint", () => {
       }),
     );
     expect(ok.status).toBe(200);
-    expect(ok.headers.get("set-cookie")).toMatch(/tl_session=.+; Path=\/; HttpOnly; SameSite=Lax/);
+    expect(ok.headers.get("set-cookie")).toMatch(/tl_dev_session=.+; Path=\/; HttpOnly; SameSite=Lax/);
     const { token } = await ok.json();
     const viaToken = await me(req("/api/me", { headers: { authorization: `Bearer ${token}` } }));
     expect((await viaToken.json()).organization.id).toBe(A.organizationId);
@@ -175,6 +175,6 @@ describe("development session endpoint", () => {
 
   it("clears the session cookie on logout", async () => {
     const res = await devLogout();
-    expect(res.headers.get("set-cookie")).toMatch(/tl_session=; .*Max-Age=0/);
+    expect(res.headers.get("set-cookie")).toMatch(/tl_dev_session=; .*Max-Age=0/);
   });
 });

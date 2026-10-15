@@ -46,10 +46,20 @@ function aadFor(organizationId: string, integrationId: string): string {
   return `integration:${organizationId}:${integrationId}`;
 }
 
+/** Encrypt credentials for a specific integration (for writes inside an existing org-scoped transaction). */
+export function encryptCredentialsFor(
+  organizationId: string,
+  integrationId: string,
+  credentials: DecryptedCredentials,
+): string {
+  return encryptSecret(JSON.stringify(credentials), getEnv().CREDENTIALS_ENCRYPTION_KEY, aadFor(organizationId, integrationId));
+}
+
+/** Org-wide integrations plus the caller's own user-scoped ones (never another member's mailbox). */
 export async function listIntegrations(auth: AuthContext): Promise<IntegrationDTO[]> {
   const rows = await withOrgScope(auth, (tx) =>
     tx.integration.findMany({
-      where: { organizationId: auth.organizationId },
+      where: { organizationId: auth.organizationId, OR: [{ ownerUserId: null }, { ownerUserId: auth.userId }] },
       select: dtoSelect,
       orderBy: { createdAt: "asc" },
     }),
@@ -57,29 +67,50 @@ export async function listIntegrations(auth: AuthContext): Promise<IntegrationDT
   return rows.map(toDTO);
 }
 
-/** Encrypt and store credentials. Called by adapters' OAuth callbacks in later specs. */
+/**
+ * Who may manage an integration's credentials:
+ *  - org-wide integration (ownerUserId = null): ADMIN or OWNER
+ *  - user-scoped integration (a personal mailbox): only its owner
+ * RLS independently hides other users' mailbox integrations.
+ */
+function assertMayManage(auth: AuthContext, row: { ownerUserId: string | null }): void {
+  if (row.ownerUserId === null) requireRole(auth, "ADMIN");
+  else if (row.ownerUserId !== auth.userId) throw new NotFoundError("Integration not found");
+}
+
+/** Encrypt and store credentials (AAD-bound to organization + integration). */
 export async function storeIntegrationCredentials(
   auth: AuthContext,
   integrationId: string,
   credentials: DecryptedCredentials,
+  opts: { tokenExpiresAt?: Date | null; audit?: boolean } = {},
 ): Promise<void> {
-  requireRole(auth, "ADMIN");
   const envelope = encryptSecret(
     JSON.stringify(credentials),
     getEnv().CREDENTIALS_ENCRYPTION_KEY,
     aadFor(auth.organizationId, integrationId),
   );
   await withOrgScope(auth, async (tx) => {
-    const { count } = await tx.integration.updateMany({
+    const row = await tx.integration.findFirst({
       where: { id: integrationId, organizationId: auth.organizationId },
-      data: { encryptedCredentials: envelope, connectedByUserId: auth.userId },
+      select: { ownerUserId: true },
     });
-    if (count === 0) throw new NotFoundError("Integration not found");
-    await recordAudit(tx, auth, {
-      event: "integration.credentials_stored",
-      entityType: "integration",
-      entityId: integrationId,
+    if (!row) throw new NotFoundError("Integration not found");
+    assertMayManage(auth, row);
+    await tx.integration.update({
+      where: { id: integrationId },
+      data: {
+        encryptedCredentials: envelope,
+        ...(opts.tokenExpiresAt !== undefined ? { tokenExpiresAt: opts.tokenExpiresAt } : {}),
+      },
     });
+    if (opts.audit !== false) {
+      await recordAudit(tx, auth, {
+        event: "integration.credentials_stored",
+        entityType: "integration",
+        entityId: integrationId,
+      });
+    }
   });
 }
 
@@ -94,10 +125,13 @@ export async function loadIntegrationCredentials(
   const row = await withOrgScope(auth, (tx) =>
     tx.integration.findFirst({
       where: { id: integrationId, organizationId: auth.organizationId },
-      select: { encryptedCredentials: true },
+      select: { encryptedCredentials: true, ownerUserId: true },
     }),
   );
   if (!row?.encryptedCredentials) throw new NotFoundError("Integration credentials not found");
+  if (row.ownerUserId !== null && row.ownerUserId !== auth.userId) {
+    throw new NotFoundError("Integration credentials not found");
+  }
   const json = decryptSecret(
     row.encryptedCredentials,
     getEnv().CREDENTIALS_ENCRYPTION_KEY,

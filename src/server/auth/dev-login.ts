@@ -26,6 +26,6 @@ export async function devLogin(
   if (!row || !isMemberRole(row.role)) throw new UnauthenticatedError("Unknown user or organization");
 
   const auth: AuthContext = { userId: row.user_id, organizationId: row.organization_id, role: row.role };
-  const token = issueSessionToken(auth, getEnv().AUTH_SESSION_SECRET);
+  const token = issueSessionToken(auth, getEnv().SESSION_SECRET);
   return { token, auth };
 }

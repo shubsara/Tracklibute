@@ -4,8 +4,8 @@
  *   acme   — alice (OWNER), bob (MEMBER), vera (VIEWER)
  *   globex — gina (OWNER)
  *
- * Each org gets the five SYSTEM responsibilities, PENDING integration rows for
- * Gmail / HubSpot / Google Calendar (no credentials), one sample recommendation
+ * Each org gets the five SYSTEM responsibilities, PENDING org-wide integration
+ * rows for HubSpot / Google Calendar (no credentials), one sample recommendation
  * and one consequential proposed action awaiting approval.
  */
 import { config as loadEnv } from "dotenv";
@@ -81,8 +81,13 @@ async function main() {
         });
       }
 
-      for (const provider of INTEGRATION_PROVIDERS) {
-        const exists = await db.integration.findFirst({ where: { organizationId: org.id, provider } });
+      // Org-wide placeholders only. Gmail is per-user and created when a member
+      // explicitly connects their mailbox; remove pre-Spec-02 org-level Gmail rows.
+      await db.integration.deleteMany({
+        where: { organizationId: org.id, provider: "GMAIL", ownerUserId: null, encryptedCredentials: null },
+      });
+      for (const provider of INTEGRATION_PROVIDERS.filter((p) => p !== "GMAIL")) {
+        const exists = await db.integration.findFirst({ where: { organizationId: org.id, provider, ownerUserId: null } });
         if (!exists) await db.integration.create({ data: { organizationId: org.id, provider } });
       }
 

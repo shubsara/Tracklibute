@@ -29,9 +29,12 @@ afterAll(async () => {
 });
 
 describe("integration abstraction", () => {
-  it("has a placeholder adapter per MVP provider that refuses network operations", async () => {
+  it("has an adapter per MVP provider; Gmail is real and read-only, the rest are placeholders", async () => {
     expect([...INTEGRATION_PROVIDERS]).toEqual(["GMAIL", "HUBSPOT", "GOOGLE_CALENDAR"]);
-    for (const provider of INTEGRATION_PROVIDERS) {
+    const gmail = getIntegrationAdapter("GMAIL");
+    expect(gmail.requiredScopes).toEqual(["https://www.googleapis.com/auth/gmail.readonly"]);
+    expect(gmail.capabilities).toEqual(["email.read"]);
+    for (const provider of ["HUBSPOT", "GOOGLE_CALENDAR"] as const) {
       const adapter = getIntegrationAdapter(provider);
       expect(adapter.provider).toBe(provider);
       await expect(adapter.checkConnection({})).rejects.toBeInstanceOf(IntegrationNotImplementedError);

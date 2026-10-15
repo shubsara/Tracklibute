@@ -1,16 +1,35 @@
 import { z } from "zod";
 
+const optionalNonEmpty = z
+  .string()
+  .optional()
+  .transform((v) => (v && v.trim() !== "" ? v.trim() : undefined));
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/ }),
   CREDENTIALS_ENCRYPTION_KEY: z
     .string()
     .refine((v) => Buffer.from(v, "base64").length === 32, "must be 32 bytes, base64-encoded"),
-  AUTH_SESSION_SECRET: z.string().min(32, "must be at least 32 characters"),
+  // Keys session-token hashing (HMAC), dev token signing and OAuth state cookies.
+  SESSION_SECRET: z.string().min(32, "must be at least 32 characters"),
   DEV_AUTH_ENABLED: z
     .enum(["true", "false"])
     .default("false")
     .transform((v) => v === "true"),
+
+  // Google (sign-in + Gmail). Optional so the app boots without them; features
+  // that need them fail with a clear "not configured" error.
+  GOOGLE_CLIENT_ID: optionalNonEmpty,
+  GOOGLE_CLIENT_SECRET: optionalNonEmpty,
+  GOOGLE_REDIRECT_URI: optionalNonEmpty.pipe(z.url().optional()),
+  GMAIL_REDIRECT_URI: optionalNonEmpty.pipe(z.url().optional()),
+  GMAIL_SYNC_CRON_SECRET: optionalNonEmpty.pipe(z.string().min(32).optional()),
+  GMAIL_SYNC_LOOKBACK_DAYS: z.coerce.number().int().min(1).max(365).default(90),
+
+  // Test-only endpoint overrides (ignored unless NODE_ENV=test).
+  GOOGLE_ISSUER: optionalNonEmpty,
+  GMAIL_API_BASE_URL: optionalNonEmpty,
 });
 
 export type Env = z.infer<typeof envSchema>;
