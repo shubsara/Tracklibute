@@ -23,8 +23,11 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
             </Link>
             {identity?.organizationId && (
               <>
+                <Link href="/opportunities">Opportunities</Link>
+                <Link href="/recommendations">Recommendations</Link>
                 <Link href="/email">Email</Link>
                 <Link href="/settings/integrations">Integrations</Link>
+                <Link href="/settings/organization">Organization</Link>
               </>
             )}
             <span className="flex-1" />

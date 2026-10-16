@@ -4,8 +4,8 @@
 // - Every tenant-owned table carries `organization_id` and is protected by
 //   PostgreSQL Row-Level Security (see the `rls_and_guards` migration).
 // - `users` is the only global table: a user can belong to several organizations.
-// - No CRM / email / contact / deal / meeting models yet. Those arrive with the
-//   normalized sales-context specs once Gmail and HubSpot adapters exist.
+// - Email context is owner-private; CRM context and the content-free
+//   EmailActivity layer are organization-readable (Build Spec 03).
 
 generator client {
   provider = "prisma-client"
@@ -34,6 +34,11 @@ model Organization {
   proposedActions    ProposedAction[]
   approvals          Approval[]
   auditLogs          AuditLog[]
+
+  // Domains whose addresses count as teammates, never as buyers (EmailActivity).
+  internalEmailDomains      String[] @default([]) @map("internal_email_domains")
+  // Bumped when the rules above change; mailboxes rebuild their EmailActivity.
+  emailActivityRulesVersion Int      @default(1) @map("email_activity_rules_version")
 
   @@map("organizations")
 }
@@ -70,9 +75,10 @@ model OrganizationMember {
   createdAt      DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt      DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  organization       Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  user               User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  ownedIntegrations  Integration[] @relation("IntegrationOwner")
+  organization      Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user              User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ownedIntegrations Integration[]     @relation("IntegrationOwner")
+  crmOwnerMappings  CrmOwnerMapping[]
 
   @@unique([organizationId, userId])
   @@index([userId])
@@ -145,17 +151,30 @@ model Integration {
   // Concurrency lease: a sync may run only while it holds an unexpired lease.
   syncLeaseExpiresAt   DateTime?           @map("sync_lease_expires_at") @db.Timestamptz(3)
   lastError            String?             @map("last_error")
+  // CRM: when the last complete full reconcile pass started (HubSpot).
+  fullSyncedAt         DateTime?           @map("full_synced_at") @db.Timestamptz(3)
+  // Mailbox: EmailActivity rules version this mailbox was derived with (0 = never).
+  emailActivityVersion Int                 @default(0) @map("email_activity_version")
   createdAt            DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt            DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  organization  Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  owner         OrganizationMember? @relation("IntegrationOwner", fields: [organizationId, ownerUserId], references: [organizationId, userId], onDelete: Cascade)
-  emailThreads  EmailThread[]
-  emailMessages EmailMessage[]
+  organization      Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  owner             OrganizationMember? @relation("IntegrationOwner", fields: [organizationId, ownerUserId], references: [organizationId, userId], onDelete: Cascade)
+  emailThreads      EmailThread[]
+  emailMessages     EmailMessage[]
+  emailActivities   EmailActivity[]
+  crmOwners         CrmOwner[]
+  crmPipelineStages CrmPipelineStage[]
+  crmCompanies      CrmCompany[]
+  crmContacts       CrmContact[]
+  crmDeals          CrmDeal[]
 
+  // Org-wide rows (owner_user_id IS NULL) are also unique per provider: a
+  // partial unique index in the spec03 migration (NULLs are distinct here).
   @@unique([organizationId, provider, externalAccountId])
   @@unique([organizationId, provider, ownerUserId])
   @@unique([organizationId, id, ownerUserId])
+  @@unique([organizationId, id])
   @@index([organizationId, provider])
   @@map("integrations")
 }
@@ -266,16 +285,28 @@ model Recommendation {
   subjectRef          Json?                  @map("subject_ref")
   evidence            Json?
   snoozedUntil        DateTime?              @map("snoozed_until") @db.Timestamptz(3)
+  // Deduplication: one row per (responsibility, dedupe key), forever. Detectors
+  // update / resolve / reopen it instead of creating duplicates.
+  dedupeKey           String?                @map("dedupe_key")
+  // Detector state + reason codes the current status was decided on.
+  fingerprint         String?
+  dealId              String?                @map("deal_id") @db.Uuid
+  lastDetectedAt      DateTime?              @map("last_detected_at") @db.Timestamptz(3)
+  resolvedAt          DateTime?              @map("resolved_at") @db.Timestamptz(3)
   createdAt           DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt           DateTime               @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   organization      Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   responsibility    Responsibility     @relation(fields: [organizationId, responsibilityId], references: [organizationId, id], onDelete: Cascade)
   responsibilityRun ResponsibilityRun? @relation(fields: [organizationId, responsibilityRunId], references: [organizationId, id], onDelete: NoAction)
+  // NoAction: services null deal_id before CRM data is deleted (history is kept).
+  deal              CrmDeal?           @relation(fields: [organizationId, dealId], references: [organizationId, id], onDelete: NoAction, map: "recommendations_deal_fkey")
   proposedActions   ProposedAction[]
 
   @@unique([organizationId, id])
+  @@unique([organizationId, responsibilityId, dedupeKey])
   @@index([organizationId, status])
+  @@index([organizationId, dealId])
   @@map("recommendations")
 }
 
@@ -472,4 +503,247 @@ model EmailMessageRecipient {
   @@id([messageId, kind, email])
   @@index([organizationId, mailboxUserId, email])
   @@map("email_message_recipients")
+}
+
+// ─── Content-free email activity (organization-readable) ───────────────────
+//
+// Derived from owner-private mail during sync. Metadata ONLY: who on the team
+// exchanged mail with which external address, in which direction, when.
+// No subject, snippet, body, labels or display names — by construction.
+// Readable by every member of the organization; written / deleted only by the
+// mailbox owner's own sync (RLS).
+
+model EmailActivity {
+  id                String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId    String         @map("organization_id") @db.Uuid
+  integrationId     String         @map("integration_id") @db.Uuid
+  mailboxUserId     String         @map("mailbox_user_id") @db.Uuid
+  // Opaque Gmail ids: idempotency / deletion key and thread reference only.
+  externalMessageId String         @map("external_message_id")
+  externalThreadId  String         @map("external_thread_id")
+  direction         EmailDirection
+  counterpartEmail  String         @map("counterpart_email")
+  counterpartDomain String         @map("counterpart_domain")
+  occurredAt        DateTime       @map("occurred_at") @db.Timestamptz(3)
+  createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  integration Integration @relation(fields: [organizationId, integrationId, mailboxUserId], references: [organizationId, id, ownerUserId], onDelete: Cascade, map: "email_activities_integration_owner_fkey")
+
+  @@unique([organizationId, mailboxUserId, externalMessageId, counterpartEmail])
+  @@index([organizationId, counterpartEmail, occurredAt])
+  @@index([organizationId, counterpartDomain, occurredAt])
+  @@index([integrationId, externalMessageId])
+  @@map("email_activities")
+}
+
+// ─── Normalized CRM context (organization-readable, read-only mirror) ──────
+//
+// Mirrors only what Opportunity Health needs from HubSpot. Tracklibute never
+// writes back to the CRM. Records are keyed by (organization, integration,
+// external id); provider ids are external identifiers only.
+
+enum CrmOwnerMappingSource {
+  AUTO_EMAIL
+  MANUAL
+
+  @@map("crm_owner_mapping_source")
+}
+
+enum OpportunityHealthState {
+  HEALTHY
+  NEEDS_ATTENTION
+  AT_RISK
+
+  @@map("opportunity_health_state")
+}
+
+model CrmOwner {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  integrationId  String   @map("integration_id") @db.Uuid
+  externalId     String   @map("external_id")
+  email          String?
+  firstName      String?  @map("first_name")
+  lastName       String?  @map("last_name")
+  archived       Boolean  @default(false)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  integration Integration      @relation(fields: [organizationId, integrationId], references: [organizationId, id], onDelete: Cascade, map: "crm_owners_integration_fkey")
+  mapping     CrmOwnerMapping?
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, integrationId, externalId])
+  @@map("crm_owners")
+}
+
+/// HubSpot owner → Tracklibute organization member.
+model CrmOwnerMapping {
+  id              String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId  String                @map("organization_id") @db.Uuid
+  crmOwnerId      String                @map("crm_owner_id") @db.Uuid
+  userId          String                @map("user_id") @db.Uuid
+  source          CrmOwnerMappingSource
+  createdByUserId String?               @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  crmOwner CrmOwner           @relation(fields: [organizationId, crmOwnerId], references: [organizationId, id], onDelete: Cascade, map: "crm_owner_mappings_owner_fkey")
+  // Removing the member removes the mapping.
+  member   OrganizationMember @relation(fields: [organizationId, userId], references: [organizationId, userId], onDelete: Cascade, map: "crm_owner_mappings_member_fkey")
+
+  @@unique([organizationId, crmOwnerId])
+  @@index([organizationId, userId])
+  @@map("crm_owner_mappings")
+}
+
+model CrmPipelineStage {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId     String   @map("organization_id") @db.Uuid
+  integrationId      String   @map("integration_id") @db.Uuid
+  pipelineExternalId String   @map("pipeline_external_id")
+  pipelineLabel      String   @map("pipeline_label")
+  externalId         String   @map("external_id")
+  label              String
+  displayOrder       Int      @default(0) @map("display_order")
+  isClosed           Boolean  @default(false) @map("is_closed")
+  isWon              Boolean? @map("is_won")
+  probability        Decimal? @db.Decimal(5, 4)
+  updatedAt          DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  integration Integration @relation(fields: [organizationId, integrationId], references: [organizationId, id], onDelete: Cascade, map: "crm_pipeline_stages_integration_fkey")
+
+  @@unique([organizationId, integrationId, pipelineExternalId, externalId])
+  @@map("crm_pipeline_stages")
+}
+
+model CrmCompany {
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId    String    @map("organization_id") @db.Uuid
+  integrationId     String    @map("integration_id") @db.Uuid
+  externalId        String    @map("external_id")
+  name              String?
+  // Lowercased host, no scheme / www.
+  domain            String?
+  archivedAt        DateTime? @map("archived_at") @db.Timestamptz(3)
+  externalUpdatedAt DateTime? @map("external_updated_at") @db.Timestamptz(3)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  integration Integration      @relation(fields: [organizationId, integrationId], references: [organizationId, id], onDelete: Cascade, map: "crm_companies_integration_fkey")
+  deals       CrmDealCompany[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, integrationId, externalId])
+  @@index([organizationId, domain])
+  @@map("crm_companies")
+}
+
+model CrmContact {
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId    String    @map("organization_id") @db.Uuid
+  integrationId     String    @map("integration_id") @db.Uuid
+  externalId        String    @map("external_id")
+  // Lowercased address — the EmailActivity match key.
+  email             String?
+  firstName         String?   @map("first_name")
+  lastName          String?   @map("last_name")
+  archivedAt        DateTime? @map("archived_at") @db.Timestamptz(3)
+  externalUpdatedAt DateTime? @map("external_updated_at") @db.Timestamptz(3)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  integration Integration      @relation(fields: [organizationId, integrationId], references: [organizationId, id], onDelete: Cascade, map: "crm_contacts_integration_fkey")
+  deals       CrmDealContact[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, integrationId, externalId])
+  @@index([organizationId, email])
+  @@map("crm_contacts")
+}
+
+model CrmDeal {
+  id                 String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId     String    @map("organization_id") @db.Uuid
+  integrationId      String    @map("integration_id") @db.Uuid
+  externalId         String    @map("external_id")
+  name               String
+  amount             Decimal?  @db.Decimal(18, 2)
+  currency           String?
+  // Joined at read time (no FK ordering dependency on owners / stages).
+  pipelineExternalId String?   @map("pipeline_external_id")
+  stageExternalId    String?   @map("stage_external_id")
+  ownerExternalId    String?   @map("owner_external_id")
+  isClosed           Boolean   @default(false) @map("is_closed")
+  isWon              Boolean?  @map("is_won")
+  closeDate          DateTime? @map("close_date") @db.Timestamptz(3)
+  externalCreatedAt  DateTime? @map("external_created_at") @db.Timestamptz(3)
+  // hs_lastmodifieddate — the incremental sync watermark.
+  externalUpdatedAt  DateTime? @map("external_updated_at") @db.Timestamptz(3)
+  // notes_last_updated: last CRM-logged activity (calls, meetings, notes, ...).
+  crmLastActivityAt  DateTime? @map("crm_last_activity_at") @db.Timestamptz(3)
+  // notes_last_contacted
+  crmLastContactedAt DateTime? @map("crm_last_contacted_at") @db.Timestamptz(3)
+  // notes_next_activity_date
+  nextActivityAt     DateTime? @map("next_activity_at") @db.Timestamptz(3)
+  archivedAt         DateTime? @map("archived_at") @db.Timestamptz(3)
+  lastSeenFullSyncAt DateTime? @map("last_seen_full_sync_at") @db.Timestamptz(3)
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  integration     Integration        @relation(fields: [organizationId, integrationId], references: [organizationId, id], onDelete: Cascade, map: "crm_deals_integration_fkey")
+  contacts        CrmDealContact[]
+  companies       CrmDealCompany[]
+  health          OpportunityHealth?
+  recommendations Recommendation[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, integrationId, externalId])
+  @@index([organizationId, isClosed, archivedAt])
+  @@map("crm_deals")
+}
+
+model CrmDealContact {
+  organizationId String @map("organization_id") @db.Uuid
+  dealId         String @map("deal_id") @db.Uuid
+  contactId      String @map("contact_id") @db.Uuid
+
+  deal    CrmDeal    @relation(fields: [organizationId, dealId], references: [organizationId, id], onDelete: Cascade, map: "crm_deal_contacts_deal_fkey")
+  contact CrmContact @relation(fields: [organizationId, contactId], references: [organizationId, id], onDelete: Cascade, map: "crm_deal_contacts_contact_fkey")
+
+  @@id([dealId, contactId])
+  @@index([organizationId, contactId])
+  @@map("crm_deal_contacts")
+}
+
+model CrmDealCompany {
+  organizationId String @map("organization_id") @db.Uuid
+  dealId         String @map("deal_id") @db.Uuid
+  companyId      String @map("company_id") @db.Uuid
+
+  deal    CrmDeal    @relation(fields: [organizationId, dealId], references: [organizationId, id], onDelete: Cascade, map: "crm_deal_companies_deal_fkey")
+  company CrmCompany @relation(fields: [organizationId, companyId], references: [organizationId, id], onDelete: Cascade, map: "crm_deal_companies_company_fkey")
+
+  @@id([dealId, companyId])
+  @@index([organizationId, companyId])
+  @@map("crm_deal_companies")
+}
+
+/// Latest deterministic Opportunity Health evaluation for an open deal.
+model OpportunityHealth {
+  id                  String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId      String                 @map("organization_id") @db.Uuid
+  dealId              String                 @map("deal_id") @db.Uuid
+  responsibilityRunId String?                @map("responsibility_run_id") @db.Uuid
+  state               OpportunityHealthState
+  // Metadata-only evidence (see src/domain/opportunity-health/evidence.ts).
+  reasons             Json
+  evaluatedAt         DateTime               @map("evaluated_at") @db.Timestamptz(3)
+  stateChangedAt      DateTime               @map("state_changed_at") @db.Timestamptz(3)
+
+  deal CrmDeal @relation(fields: [organizationId, dealId], references: [organizationId, id], onDelete: Cascade, map: "opportunity_health_deal_fkey")
+
+  @@unique([organizationId, dealId])
+  @@index([organizationId, state])
+  @@map("opportunity_health")
 }

@@ -24,6 +24,13 @@ import {
 import { log } from "@/lib/log";
 import { recordAudit } from "@/server/audit/audit-log";
 import { type Tx, withOrgScope } from "@/server/db/org-scope";
+import {
+  deleteEmailActivities,
+  loadActivityRules,
+  type MailboxActivityRules,
+  rebuildEmailActivityIfStale,
+  writeEmailActivities,
+} from "@/server/email/email-activity.service";
 
 import { type Clock, realClock } from "./gmail.client";
 import { createGmailMailboxSource } from "./gmail.adapter";
@@ -50,6 +57,9 @@ import { findOwnGmailIntegration } from "./gmail-connection.service";
  *   rate limits back off exponentially; a fatal error stops sibling workers.
  *   All writes are idempotent and run under the owner's AuthContext + RLS.
  *   Message content is never logged or audited.
+ *
+ *   Each stored message also yields content-free EmailActivity rows (same
+ *   transaction; deleted with the message) — see email-activity.service.
  */
 export const LEASE_SECONDS = 10 * 60;
 export const BATCH_SIZE = 100;
@@ -108,6 +118,7 @@ interface SyncCtx {
   clock: Clock;
   deadlineAt: number;
   fetchesRemaining: number;
+  activityRules: MailboxActivityRules;
   counters: { upserted: number; deleted: number; skipped: number; alreadySynced: number; threads: Set<string> };
 }
 
@@ -232,6 +243,7 @@ async function persistBatch(ctx: SyncCtx, messages: NormalizedEmailMessage[]): P
     }
 
     if (fresh.length) {
+      const directionOf = new Map(fresh.map((m) => [m.id, determineDirection(m.from, ctx.mailboxAddress, m.labels)]));
       await tx.emailMessage.createMany({
         data: fresh.map((m) => ({
           id: m.id,
@@ -247,7 +259,7 @@ async function persistBatch(ctx: SyncCtx, messages: NormalizedEmailMessage[]): P
           bodyTruncated: m.bodyTruncated,
           sentAt: m.sentAt,
           receivedAt: m.receivedAt,
-          direction: determineDirection(m.from, ctx.mailboxAddress, m.labels),
+          direction: directionOf.get(m.id)!,
           labels: [...m.labels],
           headers: m.metadata as unknown as Prisma.InputJsonValue,
         })),
@@ -273,6 +285,22 @@ async function persistBatch(ctx: SyncCtx, messages: NormalizedEmailMessage[]): P
         return rows;
       });
       if (recipients.length) await tx.emailMessageRecipient.createMany({ data: recipients, skipDuplicates: true });
+      await writeEmailActivities(
+        tx,
+        auth,
+        integrationId,
+        { ...ctx.activityRules, mailboxAddress: ctx.mailboxAddress },
+        fresh.map((m) => ({
+          externalMessageId: m.externalMessageId,
+          externalThreadId: m.externalThreadId,
+          direction: directionOf.get(m.id)!,
+          from: m.from,
+          to: m.to,
+          cc: m.cc,
+          metadata: m.metadata,
+          occurredAt: m.receivedAt,
+        })),
+      );
     }
 
     const touched = [...new Set(messages.map((m) => threadIdByExt.get(m.externalThreadId)!))];
@@ -295,6 +323,7 @@ async function deleteMessages(ctx: SyncCtx, externalIds: string[]): Promise<void
     const rows = await tx.emailMessage.findMany({ where, select: { threadId: true } });
     if (rows.length === 0) return;
     const { count } = await tx.emailMessage.deleteMany({ where });
+    await deleteEmailActivities(tx, auth, integrationId, externalIds);
     await recomputeThreads(tx, [...new Set(rows.map((r) => r.threadId))]);
     ctx.counters.deleted += count;
   });
@@ -509,11 +538,16 @@ export async function syncGmailMailbox(auth: AuthContext, opts: GmailSyncOptions
     integrationId: integration.id,
     trigger: opts.trigger,
   };
+  const mailboxAddress = integration.externalAccountId ?? "";
+  // Backfill / rule change: re-derive EmailActivity from stored mail (no Gmail calls).
+  await rebuildEmailActivityIfStale(auth, integration.id, mailboxAddress);
+  const activityRules = await withOrgScope(auth, (tx) => loadActivityRules(tx, auth, mailboxAddress));
   const ctx: SyncCtx = {
     auth,
     integrationId: integration.id,
     lease,
-    mailboxAddress: integration.externalAccountId ?? "",
+    activityRules,
+    mailboxAddress,
     clock,
     deadlineAt: opts.deadlineAt ?? started + env.GMAIL_SYNC_RUN_BUDGET_SECONDS * 1000,
     fetchesRemaining: opts.maxMessageFetches ?? Number.POSITIVE_INFINITY,

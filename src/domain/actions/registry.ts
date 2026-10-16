@@ -45,6 +45,24 @@ export const ACTION_REGISTRY = {
       .object({ recommendationId: z.uuid(), until: z.iso.datetime({ offset: true }) })
       .strict(),
   },
+  "recommendation.dismiss": {
+    type: "recommendation.dismiss",
+    description: "Dismiss a recommendation inside Tracklibute (it reopens only if the problem gets worse).",
+    provider: null,
+    capability: null,
+    consequential: false,
+    minRole: "MEMBER",
+    payloadSchema: z.object({ recommendationId: z.uuid() }).strict(),
+  },
+  "recommendation.accept": {
+    type: "recommendation.accept",
+    description: "Acknowledge a recommendation inside Tracklibute (\"I'm on it\").",
+    provider: null,
+    capability: null,
+    consequential: false,
+    minRole: "MEMBER",
+    payloadSchema: z.object({ recommendationId: z.uuid() }).strict(),
+  },
   "gmail.create_draft": {
     type: "gmail.create_draft",
     description: "Create a Gmail draft for the user to review. Nothing is sent.",
