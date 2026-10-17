@@ -41,7 +41,7 @@ describe("read-only allow-list", () => {
   it("only GETs and read-only query POSTs exist; no PATCH/PUT/DELETE, no object create/update/archive", () => {
     for (const r of HUBSPOT_ALLOWED_REQUESTS) {
       expect(["GET", "POST"]).toContain(r.method);
-      if (r.method === "POST") expect(r.path.source).toMatch(/oauth\\\/v3\\\/token|search|batch\\\/read/);
+      if (r.method === "POST") expect(r.path.source).toMatch(/oauth\\\/2026-03\\\/token|search|batch\\\/read/);
     }
     const refused: Array<[string, string]> = [
       ["POST", "/crm/v3/objects/tasks"],
@@ -54,6 +54,17 @@ describe("read-only allow-list", () => {
       ["POST", "/crm/v3/objects/notes"],
       ["POST", "/engagements/v1/engagements"],
       ["DELETE", "/oauth/v1/refresh-tokens/x"],
+      // Deprecated / superseded endpoints are no longer reachable at all.
+      ["GET", "/oauth/v1/access-tokens/some-token"],
+      ["POST", "/oauth/v1/token"],
+      ["POST", "/oauth/v3/token"],
+      ["POST", "/oauth/2026-03/token/revoke"],
+      ["GET", "/crm/v3/pipelines/deals"],
+      ["GET", "/crm-pipelines/v1/pipelines/deals"],
+      ["POST", "/crm/pipelines/2026-09/deals"],
+      ["PATCH", "/crm/pipelines/2026-09/deals/default"],
+      ["DELETE", "/crm/pipelines/2026-09/deals/default/stages/s1"],
+      ["GET", "/crm/pipelines/2026-09/tickets"],
       ["GET", "/crm/v3/objects/deals/../tasks"],
     ];
     for (const [m, p] of refused) expect(() => assertAllowedHubSpotRequest(m, p)).toThrow(HubSpotRequestNotAllowedError);
@@ -145,6 +156,25 @@ describe("mapper", () => {
     expect(d.nextActivityAt).toBeInstanceOf(Date);
     expect(parseHubSpotDate("garbage")).toBeNull();
     expect(mapCompany({ id: "9", properties: { domain: "https://www.Buyer.io" } }).domain).toBe("buyer.io");
+  });
+
+  it("stages (2026-09 shape): missing or unusable isClosed stays UNKNOWN, never defaulted", () => {
+    const s = mapStages({
+      results: [
+        {
+          id: "p",
+          label: "P",
+          archived: true,
+          stages: [
+            { id: "a", label: "No flag", metadata: { probability: "0.5" } },
+            { id: "b", label: "Null meta", metadata: null },
+            { id: "c", label: "Weird", metadata: { isClosed: "maybe" } },
+            { id: "d", label: "Bool", metadata: { isClosed: true, probability: 0 } },
+          ],
+        },
+      ],
+    });
+    expect(s.map((x) => [x.externalId, x.isClosed, x.isWon])).toEqual([["a", null, null], ["b", null, null], ["c", null, null], ["d", true, false]]);
   });
 
   it("stages: closed + probability 1 = won", () => {

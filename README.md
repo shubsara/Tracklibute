@@ -325,14 +325,35 @@ Google's limits (Usage limits page, updated 2026-09-10):
 - **Scopes requested** (read only): `oauth`, `crm.objects.deals.read`,
   `crm.objects.contacts.read`, `crm.objects.companies.read`,
   `crm.objects.owners.read`. A grant carrying any write scope is refused.
-- **HubSpot app setup:** create a HubSpot app with exactly these scopes and the
-  redirect URL `…/api/integrations/hubspot/callback`.
+- **HubSpot app setup:** create an **account-level** HubSpot OAuth app (not
+  user-level: `isUserLevel` must be false or unset) with exactly these scopes
+  and the redirect URL `…/api/integrations/hubspot/callback`. HubSpot
+  documents that user-level apps can't use several APIs the sync needs (owners,
+  association batch reads, v3 objects/search), so Tracklibute refuses tokens
+  whose introspection reports `isUserLevel: true`.
+- **OAuth endpoints (date-versioned 2026-03):** `POST /oauth/2026-03/token`
+  handles both the code exchange and refresh. `POST
+  /oauth/2026-03/token/introspect` checks that the token is active, is an access
+  token, was issued to our client ID, names a portal, and grants exactly the
+  read scopes. Every credential travels in a form body, never in a URL. The
+  deprecated v1 endpoints are no longer used or reachable.
 - **No write path exists.** Every HubSpot request passes a closed
   (method, path) allow-list in `hubspot.client.ts`. The only POSTs are the
-  OAuth token exchange and read-only queries (search, batch read). The
-  `hubspot.*` actions stay in the registry without an executor.
+  OAuth token exchange and introspection, plus read-only queries (search,
+  batch read). The `hubspot.*` actions stay in the registry without an executor.
 - **Sync:**
-  - Owners and deal pipeline stages are refreshed on every run.
+  - Owners and deal pipeline stages are refreshed on every run. Stages come
+    from `GET /crm/pipelines/2026-09/deals`.
+  - **Pipelines unavailable:** if HubSpot refuses pipeline reads (403 without
+    `MISSING_SCOPES`, 404) or returns an unusable shape, the run continues.
+    The integration shows pipeline metadata as `UNAVAILABLE`, with a safe
+    reason. The last stage metadata HubSpot actually returned is kept, and
+    nothing is invented.
+  - **Open/closed classification:** a deal's open/closed status comes from its
+    stage's `isClosed`. If the stage doesn't state it, HubSpot's calculated
+    `hs_is_closed` is used. Otherwise the status is stored as **unknown**.
+    Unknown-status deals are never evaluated by Opportunity Health, and their
+    recommendations are left untouched.
   - A **full reconcile** (deals list with embedded associations) runs on first
     connect and every 24 h. It is resumable, and deals not seen in a
     *complete* pass are archived.
@@ -535,9 +556,14 @@ PostgreSQL. Create a `tracklibute_app` role without `BYPASSRLS` before running
 - **HubSpot list associations** are taken as embedded in the deals list. A deal
   with more associations than HubSpot embeds per record may be incomplete
   until an incremental update fetches them via v4.
-- **Token metadata** uses `GET /oauth/v1/access-tokens/{token}` to read `hub_id`
-  and the granted scopes. Verify this against a real HubSpot app before
-  production.
+- **Not yet verified against a real HubSpot portal:** the OAuth 2026-03
+  endpoints, introspection fields and Pipelines 2026-09 behaviour are
+  implemented from HubSpot's current documentation and tested against an
+  in-process fake only.
+- **Other CRM reads still use v3/v4 paths** (`/crm/v3/objects/*`,
+  `/crm/v3/owners`, `/crm/v4/associations/*`). They are documented and
+  supported for account-level apps, but HubSpot now lists them under its
+  *legacy* API family.
 - **Clearing an owner mapping** lets sync re-create an AUTO mapping if the
   emails still match.
 - **The opportunity detector counts only connected mailboxes.** That is why

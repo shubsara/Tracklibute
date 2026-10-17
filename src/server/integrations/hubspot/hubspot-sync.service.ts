@@ -62,6 +62,12 @@ export interface HubSpotSyncResult {
   ownersUpserted: number;
   stagesUpserted: number;
   ownersAutoMapped: number;
+  /** Deals whose stage is not in the known stage metadata. */
+  dealsWithUnknownStage: number;
+  /** Deals whose open/closed status could not be determined (stored as unknown). */
+  dealsClosedStatusUnknown: number;
+  /** Whether deal pipeline/stage metadata could be read this run. */
+  pipelineMetadata: "OK" | "UNAVAILABLE";
   durationMs: number;
 }
 
@@ -111,8 +117,9 @@ interface SyncCtx {
   lease: Date;
   clock: Clock;
   deadlineAt: number;
-  stages: Map<string, CrmStageRecord>;
-  counters: Omit<HubSpotSyncResult, "integrationId" | "mode" | "outcome" | "trigger" | "resumed" | "durationMs">;
+  stages: Map<string, Pick<CrmStageRecord, "isClosed" | "isWon">>;
+  pipelineMetadata: "OK" | "UNAVAILABLE";
+  counters: Omit<HubSpotSyncResult, "integrationId" | "mode" | "outcome" | "trigger" | "resumed" | "durationMs" | "pipelineMetadata">;
 }
 
 const budgetExhausted = (ctx: SyncCtx) => ctx.clock.now() >= ctx.deadlineAt;
@@ -149,6 +156,31 @@ async function checkpoint(ctx: SyncCtx, data: { syncCursor?: string | null; back
 
 // ─── Owners + stages ────────────────────────────────────────────────────────
 
+/**
+ * Deal pipeline metadata (GET /crm/pipelines/2026-09/deals). A revoked grant,
+ * missing scope, rate limit or outage propagates as usual. If HubSpot refuses
+ * or returns an unusable shape (403 without MISSING_SCOPES, 404, malformed),
+ * the run continues WITHOUT fresh stage metadata: previously stored stages
+ * (real HubSpot data) are kept, nothing is invented, and the integration is
+ * marked pipeline-metadata UNAVAILABLE with a safe reason code.
+ */
+async function fetchDealStages(ctx: SyncCtx, source: CrmSource): Promise<{ stages: readonly CrmStageRecord[] | null; error: string | null }> {
+  try {
+    return { stages: await source.listDealStages(), error: null };
+  } catch (err) {
+    if (err instanceof CrmError && (err.kind === "forbidden" || err.kind === "invalid_response")) {
+      log.warn("hubspot.pipelines_unavailable", {
+        organizationId: ctx.auth.organizationId,
+        integrationId: ctx.integrationId,
+        reason: err.kind,
+        ...err.diagnostics,
+      });
+      return { stages: null, error: err.diagnostics.httpStatus === 404 ? "not_found" : err.kind };
+    }
+    throw err;
+  }
+}
+
 async function syncOwnersAndStages(ctx: SyncCtx, source: CrmSource): Promise<void> {
   const owners: CrmOwnerRecord[] = [];
   let after: string | undefined;
@@ -157,7 +189,8 @@ async function syncOwnersAndStages(ctx: SyncCtx, source: CrmSource): Promise<voi
     owners.push(...page.items);
     after = page.next ?? undefined;
   } while (after);
-  const stages = await source.listDealStages();
+  const fetched = await fetchDealStages(ctx, source);
+  const stages = fetched.stages ?? [];
 
   const { auth, integrationId } = ctx;
   const scope = { organizationId: auth.organizationId, integrationId };
@@ -196,14 +229,30 @@ async function syncOwnersAndStages(ctx: SyncCtx, source: CrmSource): Promise<voi
         update: data,
       });
     }
-    if (stages.length) {
+    // Only a successful fetch may remove stages HubSpot no longer reports.
+    if (fetched.stages && stages.length) {
       const keep = new Set(stages.map((s) => `${s.pipelineExternalId}/${s.externalId}`));
       const all = await tx.crmPipelineStage.findMany({ where: scope, select: { id: true, pipelineExternalId: true, externalId: true } });
       const stale = all.filter((s) => !keep.has(`${s.pipelineExternalId}/${s.externalId}`)).map((s) => s.id);
       if (stale.length) await tx.crmPipelineStage.deleteMany({ where: { ...scope, id: { in: stale } } });
     }
+    const n = await tx.$executeRaw`
+      UPDATE integrations
+         SET pipeline_metadata_status = ${fetched.stages ? "OK" : "UNAVAILABLE"},
+             pipeline_metadata_error = ${fetched.error}, updated_at = now()
+       WHERE id = ${integrationId}::uuid AND sync_lease_expires_at = ${ctx.lease}`;
+    if (n === 0) throw new LeaseLostError();
   });
-  ctx.stages = new Map(stages.map((s) => [`${s.pipelineExternalId}/${s.externalId}`, s]));
+  ctx.pipelineMetadata = fetched.stages ? "OK" : "UNAVAILABLE";
+  if (fetched.stages) {
+    ctx.stages = new Map(stages.map((s) => [`${s.pipelineExternalId}/${s.externalId}`, s]));
+  } else {
+    // Fall back to the last stage metadata HubSpot actually returned (if any).
+    const stored = await withOrgScope(auth, (tx) =>
+      tx.crmPipelineStage.findMany({ where: scope, select: { pipelineExternalId: true, externalId: true, isClosed: true, isWon: true } }),
+    );
+    ctx.stages = new Map(stored.map((s) => [`${s.pipelineExternalId}/${s.externalId}`, { isClosed: s.isClosed, isWon: s.isWon }]));
+  }
   ctx.counters.ownersUpserted += owners.length;
   ctx.counters.stagesUpserted += stages.length;
   ctx.counters.ownersAutoMapped += await autoMapOwners(auth, integrationId);
@@ -261,6 +310,12 @@ async function persistDeals(ctx: SyncCtx, source: CrmSource, deals: readonly Crm
     const companyIds = await upsertCompanies(tx, scope, companies);
     for (const d of deals) {
       const stage = d.pipelineExternalId && d.stageExternalId ? ctx.stages.get(`${d.pipelineExternalId}/${d.stageExternalId}`) : undefined;
+      // Open/closed: the stage's metadata when it states it; else HubSpot's own
+      // calculated hs_is_closed for the deal; else UNKNOWN (null) — never guessed.
+      const stageClosed = stage?.isClosed ?? null;
+      const isClosed = stageClosed ?? d.isClosed ?? null;
+      if (!stage) ctx.counters.dealsWithUnknownStage++;
+      if (isClosed === null) ctx.counters.dealsClosedStatusUnknown++;
       const data = {
         name: d.name,
         amount: d.amount,
@@ -268,8 +323,8 @@ async function persistDeals(ctx: SyncCtx, source: CrmSource, deals: readonly Crm
         pipelineExternalId: d.pipelineExternalId,
         stageExternalId: d.stageExternalId,
         ownerExternalId: d.ownerExternalId,
-        isClosed: stage ? stage.isClosed : (d.isClosed ?? false),
-        isWon: stage ? stage.isWon : d.isWon,
+        isClosed,
+        isWon: stageClosed !== null ? stage!.isWon : d.isWon,
         closeDate: d.closeDate,
         externalCreatedAt: d.externalCreatedAt,
         externalUpdatedAt: d.externalUpdatedAt,
@@ -421,6 +476,7 @@ export async function syncHubSpot(auth: AuthContext, opts: HubSpotSyncOptions): 
     clock,
     deadlineAt: opts.deadlineAt ?? started + env.HUBSPOT_SYNC_RUN_BUDGET_SECONDS * 1000,
     stages: new Map(),
+    pipelineMetadata: "OK",
     counters: {
       dealsUpserted: 0,
       dealsArchived: 0,
@@ -429,6 +485,8 @@ export async function syncHubSpot(auth: AuthContext, opts: HubSpotSyncOptions): 
       ownersUpserted: 0,
       stagesUpserted: 0,
       ownersAutoMapped: 0,
+      dealsWithUnknownStage: 0,
+      dealsClosedStatusUnknown: 0,
     },
   };
   const logBase = { organizationId: auth.organizationId, integrationId: integration.id, trigger: opts.trigger };
@@ -463,7 +521,7 @@ export async function syncHubSpot(auth: AuthContext, opts: HubSpotSyncOptions): 
         event: step.complete ? "hubspot.sync_completed" : "hubspot.sync_partial",
         entityType: "integration",
         entityId: integration.id,
-        metadata: { trigger: opts.trigger, mode, resumed, ...ctx.counters },
+        metadata: { trigger: opts.trigger, mode, resumed, ...ctx.counters, pipelineMetadata: ctx.pipelineMetadata },
       }, { actor });
       return true;
     });
@@ -476,6 +534,7 @@ export async function syncHubSpot(auth: AuthContext, opts: HubSpotSyncOptions): 
       trigger: opts.trigger,
       resumed,
       ...ctx.counters,
+      pipelineMetadata: ctx.pipelineMetadata,
       durationMs: clock.now() - started,
     };
     log.info(step.complete ? "hubspot.sync_completed" : "hubspot.sync_partial", { ...logBase, ...result });

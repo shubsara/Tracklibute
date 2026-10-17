@@ -58,7 +58,14 @@ export async function GET(request: Request): Promise<Response> {
   } catch (err) {
     const reason = err instanceof AppError ? err.code : err instanceof CrmError ? err.kind : "error";
     log.warn("hubspot.connect_failed", { organizationId: auth.organizationId, reason, errorName: err instanceof Error ? err.name : typeof err });
-    const outcome = err instanceof AppError && err.code === "validation_failed" ? "permissions" : "connect_failed";
+    const outcome =
+      err instanceof AppError && err.code === "validation_failed"
+        ? "permissions"
+        : err instanceof AppError && err.code === "policy_violation"
+          ? "app_config"
+          : err instanceof AppError && err.code === "service_unavailable"
+            ? "not_configured"
+            : "connect_failed";
     return redirect(`${SETTINGS}?hubspot=${outcome}`, 303, [clearTx]);
   }
 }

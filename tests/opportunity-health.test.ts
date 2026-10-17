@@ -192,6 +192,23 @@ describe("recommendation lifecycle", () => {
   });
 });
 
+describe("unknown open/closed status", () => {
+  it("deals whose status cannot be determined are skipped and their recommendations left untouched", async () => {
+    const before = (await recFor("lonely"))!;
+    expect(before.status).not.toBe("RESOLVED");
+    // Pipeline metadata becomes unavailable and the deal's stage is no longer known.
+    const lonely = await ownerDb().crmDeal.findFirstOrThrow({ where: { integrationId, name: "lonely" } });
+    await ownerDb().crmDeal.update({ where: { id: lonely.id }, data: { isClosed: null } });
+    const r = await runOpportunityHealth(admin, { trigger: "cron" });
+    expect(r.skippedUnknownStatus).toBe(1);
+    const after = (await recFor("lonely"))!;
+    expect(after.status).toBe(before.status);
+    expect(after.updatedAt.getTime()).toBe(before.updatedAt.getTime());
+    expect((await health()).lonely).toBeNull(); // no stale health claim kept
+    await ownerDb().crmDeal.update({ where: { id: lonely.id }, data: { isClosed: false } });
+  });
+});
+
 describe("guards", () => {
   it("one run at a time; stale runs are recovered", async () => {
     const stuck = await ownerDb().responsibilityRun.create({ data: { organizationId: org.organizationId, responsibilityId, status: "RUNNING", startedAt: new Date() } });

@@ -28,6 +28,11 @@ export interface HubSpotStatusDTO {
   syncInProgress: boolean;
   deals: number;
   openDeals: number;
+  /** Deals whose open/closed status could not be determined; excluded from Opportunity Health. */
+  unknownStatusDeals: number;
+  /** "OK" | "UNAVAILABLE" | null (never attempted); see pipelineMetadataError for a safe reason code. */
+  pipelineMetadataStatus: string | null;
+  pipelineMetadataError: string | null;
   owners: number;
   unmappedOwners: number;
 }
@@ -58,17 +63,20 @@ export async function getHubSpotStatus(auth: AuthContext): Promise<HubSpotStatus
         fullSyncedAt: true,
         lastError: true,
         syncLeaseExpiresAt: true,
+        pipelineMetadataStatus: true,
+        pipelineMetadataError: true,
       },
     });
     const scope = { organizationId: auth.organizationId, integrationId: row?.id ?? "00000000-0000-0000-0000-000000000000" };
-    const [deals, openDeals, owners, unmappedOwners] = row
+    const [deals, openDeals, unknownStatusDeals, owners, unmappedOwners] = row
       ? await Promise.all([
           tx.crmDeal.count({ where: { ...scope, archivedAt: null } }),
           tx.crmDeal.count({ where: { ...scope, archivedAt: null, isClosed: false } }),
+          tx.crmDeal.count({ where: { ...scope, archivedAt: null, isClosed: null } }),
           tx.crmOwner.count({ where: { ...scope, archived: false } }),
           tx.crmOwner.count({ where: { ...scope, archived: false, mapping: null } }),
         ])
-      : [0, 0, 0, 0];
+      : [0, 0, 0, 0, 0];
     const active = row && row.status !== "PENDING" && row.status !== "DISCONNECTED";
     return {
       connected: row?.status === "CONNECTED",
@@ -82,6 +90,9 @@ export async function getHubSpotStatus(auth: AuthContext): Promise<HubSpotStatus
       syncInProgress: Boolean(row?.syncLeaseExpiresAt && row.syncLeaseExpiresAt > new Date()),
       deals,
       openDeals,
+      unknownStatusDeals,
+      pipelineMetadataStatus: active ? row.pipelineMetadataStatus : null,
+      pipelineMetadataError: active ? row.pipelineMetadataError : null,
       owners,
       unmappedOwners,
     };
@@ -212,6 +223,8 @@ export async function disconnectHubSpot(auth: AuthContext): Promise<void> {
         syncCursor: null,
         backfillCursor: null,
         fullSyncedAt: null,
+        pipelineMetadataStatus: null,
+        pipelineMetadataError: null,
         syncLeaseExpiresAt: null,
         lastError: null,
       },

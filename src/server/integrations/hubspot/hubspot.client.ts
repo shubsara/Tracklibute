@@ -10,7 +10,8 @@ import type { HubSpotErrorBody } from "./hubspot.types";
  *
  * Every request — OAuth included — passes `assertAllowedHubSpotRequest`, a
  * closed allow-list of (method, path) pairs. The only POSTs are the OAuth
- * token exchange and read-only query endpoints (search, batch read); any
+ * token exchange / introspection and read-only query endpoints (search,
+ * batch read); any
  * other method or path throws before a network call is made. There is no
  * code path that can create, update or delete a HubSpot record.
  *
@@ -26,7 +27,7 @@ export const HUBSPOT_API_BASE_URL = "https://api.hubapi.com";
 
 export type HubSpotEndpoint =
   | "oauth.token"
-  | "oauth.tokenInfo"
+  | "oauth.introspect"
   | "owners.list"
   | "pipelines.deals"
   | "deals.list"
@@ -43,10 +44,12 @@ interface AllowedRequest {
 
 /** The complete set of HubSpot requests Tracklibute can make. */
 export const HUBSPOT_ALLOWED_REQUESTS: readonly AllowedRequest[] = [
-  { endpoint: "oauth.token", method: "POST", path: /^\/oauth\/v3\/token$/ },
-  { endpoint: "oauth.tokenInfo", method: "GET", path: /^\/oauth\/v1\/access-tokens\/[A-Za-z0-9._~-]+$/ },
+  // OAuth 2026-03: every secret travels in the form body, never in the URL.
+  { endpoint: "oauth.token", method: "POST", path: /^\/oauth\/2026-03\/token$/ },
+  { endpoint: "oauth.introspect", method: "POST", path: /^\/oauth\/2026-03\/token\/introspect$/ },
   { endpoint: "owners.list", method: "GET", path: /^\/crm\/v3\/owners$/ },
-  { endpoint: "pipelines.deals", method: "GET", path: /^\/crm\/v3\/pipelines\/deals$/ },
+  // Pipelines 2026-09 (read): deal pipelines only.
+  { endpoint: "pipelines.deals", method: "GET", path: /^\/crm\/pipelines\/2026-09\/deals$/ },
   { endpoint: "deals.list", method: "GET", path: /^\/crm\/v3\/objects\/deals$/ },
   { endpoint: "deals.search", method: "POST", path: /^\/crm\/v3\/objects\/deals\/search$/ },
   { endpoint: "associations.batchRead", method: "POST", path: /^\/crm\/v4\/associations\/deals\/(contacts|companies)\/batch\/read$/ },
@@ -56,7 +59,7 @@ export const HUBSPOT_ALLOWED_REQUESTS: readonly AllowedRequest[] = [
 
 export class HubSpotRequestNotAllowedError extends Error {
   constructor(method: string, path: string) {
-    // The path may contain a token (tokenInfo); never include it.
+    // Never echo the full path (defence in depth against secrets in URLs).
     super(`HubSpot request refused by the read-only allow-list (${method} ${path.split("/").slice(0, 4).join("/")}…)`);
     this.name = "HubSpotRequestNotAllowedError";
   }
@@ -253,8 +256,9 @@ function retryAfterMs(res: Response): number | null {
 }
 
 /**
- * HubSpot's machine-readable codes only (policyName for 429s, category,
- * status for OAuth errors) — never message text, which can echo request data.
+ * HubSpot's machine-readable codes only (policyName for 429s, RFC 6749
+ * `error` / legacy `status` for OAuth, category for CRM) — never `message` or
+ * `error_description` text, which can echo request data.
  */
 export async function readReason(res: Response): Promise<string | null> {
   try {
@@ -262,6 +266,7 @@ export async function readReason(res: Response): Promise<string | null> {
     const policy = typeof e.policyName === "string" ? e.policyName : null;
     const candidates = [
       policy === "DAILY" ? "DAILY" : null,
+      e.error,
       e.category,
       e.status !== "error" ? e.status : null,
       e.errorType,

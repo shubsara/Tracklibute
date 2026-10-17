@@ -6,7 +6,8 @@ import type { TestClock } from "./fake-google";
 
 /**
  * In-process fake of the HubSpot endpoints Tracklibute uses:
- *   OAuth v3 token (code + refresh) · token metadata · owners · deal pipelines
+ *   OAuth 2026-03 token (code + refresh) · OAuth 2026-03 introspection ·
+ *   owners · deal pipelines (2026-09)
  *   deals list · deals search · v4 association batch read · contacts / companies batch read
  * Records every request (method + path) so tests can prove nothing else —
  * in particular no write — is ever sent. Unknown requests get 404 and are
@@ -47,6 +48,14 @@ export class FakeHubSpot {
   private refreshTokens = new Map<string, { hubId: string; scopes: string[]; revoked: boolean }>();
   private accessTokens = new Map<string, { hubId: string; scopes: string[]; expiresAt: number }>();
   accessTokenTtlSeconds = 1800;
+  /** Introspection scripting: field overrides merged into the response, or a raw malformed body. */
+  introspection: { overrides?: Record<string, unknown>; malformed?: boolean } = {};
+  /** Token-endpoint scripting: extra fields merged into successful responses. */
+  tokenResponseExtra: Record<string, unknown> = {};
+  /** Every OAuth form body received (tests assert secrets never appear in URLs). */
+  oauthBodies: string[] = [];
+  /** Full request URLs (path + query) — tests assert no secret is ever in one. */
+  urls: string[] = [];
   /** Every request seen: "METHOD /path". */
   requests: string[] = [];
   /** Requests that matched no emulated endpoint. */
@@ -63,7 +72,8 @@ export class FakeHubSpot {
   daily: { max: number; remaining: number } | null = null;
 
   owners: Array<{ id: string; email: string | null; firstName: string | null; lastName: string | null; archived?: boolean }> = [];
-  pipelines: Array<{ id: string; label: string; stages: Array<{ id: string; label: string; isClosed: boolean; probability: number }> }> = [
+  /** Stage metadata as HubSpot returns it; `isClosed: undefined` omits the key. */
+  pipelines: Array<{ id: string; label: string; archived?: boolean; stages: Array<{ id: string; label: string; isClosed?: boolean; probability?: number }> }> = [
     {
       id: "default",
       label: "Sales Pipeline",
@@ -170,7 +180,8 @@ export class FakeHubSpot {
   /** Requests that are not GETs and not one of the read-only query POSTs (should always be empty). */
   writeRequests(): string[] {
     const readPosts = [
-      /^POST \/oauth\/v3\/token$/,
+      /^POST \/oauth\/2026-03\/token$/,
+      /^POST \/oauth\/2026-03\/token\/introspect$/,
       /^POST \/crm\/v3\/objects\/deals\/search$/,
       /^POST \/crm\/v4\/associations\/deals\/(contacts|companies)\/batch\/read$/,
       /^POST \/crm\/v3\/objects\/(contacts|companies)\/batch\/read$/,
@@ -216,7 +227,9 @@ export class FakeHubSpot {
     const path = url.pathname;
     const method = req.method ?? "GET";
     this.requests.push(`${method} ${path}`);
+    this.urls.push(`${method} ${req.url ?? ""}`);
     const raw = method === "POST" ? await this.readBody(req) : "";
+    if (path.startsWith("/oauth/")) this.oauthBodies.push(raw);
 
     const failure = this.failures.find((f) => f.times > 0 && f.path.test(path));
     if (failure) {
@@ -224,33 +237,73 @@ export class FakeHubSpot {
       return this.send(res, failure.status, failure.body ?? { status: "error", category: "INJECTED" }, failure.headers);
     }
 
-    // OAuth
-    if (method === "POST" && path === "/oauth/v3/token") {
+    // OAuth 2026-03 (RFC 6749 errors + legacy status/message, as documented)
+    const oauthError = (status: number, error: string, legacy: string) =>
+      this.send(res, status, { error, error_description: "fake error", status: legacy, message: "fake error" });
+    if (path.startsWith("/oauth/")) {
+      if (url.search) return oauthError(400, "invalid_request", "BAD_REQUEST"); // secrets in URLs are refused
       const form = new URLSearchParams(raw);
       if (form.get("client_id") !== FAKE_HUBSPOT_CLIENT_ID || form.get("client_secret") !== FAKE_HUBSPOT_CLIENT_SECRET) {
-        return this.send(res, 400, { status: "BAD_CLIENT_ID", message: "bad client" });
+        return oauthError(401, "invalid_client", "BAD_CLIENT_ID");
       }
-      if (form.get("grant_type") === "authorization_code") {
-        const grant = this.codes.get(form.get("code") ?? "");
-        if (!grant || grant.redirectUri !== form.get("redirect_uri")) return this.send(res, 400, { status: "BAD_AUTH_CODE", message: "bad code" });
-        this.codes.delete(form.get("code")!);
-        const t = this.issueTokens(grant.hubId, { scopes: grant.scopes });
-        return this.send(res, 200, { access_token: t.accessToken, refresh_token: t.refreshToken, expires_in: this.accessTokenTtlSeconds, token_type: "bearer" });
+      if (method === "POST" && path === "/oauth/2026-03/token") {
+        if (form.get("grant_type") === "authorization_code") {
+          const grant = this.codes.get(form.get("code") ?? "");
+          if (!grant || grant.redirectUri !== form.get("redirect_uri")) return oauthError(400, "invalid_grant", "BAD_AUTH_CODE");
+          this.codes.delete(form.get("code")!);
+          const t = this.issueTokens(grant.hubId, { scopes: grant.scopes });
+          return this.send(res, 200, {
+            token_type: "bearer",
+            access_token: t.accessToken,
+            refresh_token: t.refreshToken,
+            expires_in: this.accessTokenTtlSeconds,
+            hub_id: Number(grant.hubId),
+            scopes: grant.scopes,
+            ...this.tokenResponseExtra,
+          });
+        }
+        if (form.get("grant_type") === "refresh_token") {
+          const r = this.refreshTokens.get(form.get("refresh_token") ?? "");
+          if (!r || r.revoked) return oauthError(400, "invalid_grant", "BAD_REFRESH_TOKEN");
+          const access = `hat-${randomBytes(12).toString("hex")}`;
+          this.accessTokens.set(access, { hubId: r.hubId, scopes: r.scopes, expiresAt: Date.now() + this.accessTokenTtlSeconds * 1000 });
+          return this.send(res, 200, {
+            token_type: "bearer",
+            access_token: access,
+            refresh_token: form.get("refresh_token"),
+            expires_in: this.accessTokenTtlSeconds,
+            hub_id: Number(r.hubId),
+            scopes: r.scopes,
+            ...this.tokenResponseExtra,
+          });
+        }
+        return oauthError(400, "unsupported_grant_type", "BAD_GRANT_TYPE");
       }
-      if (form.get("grant_type") === "refresh_token") {
-        const r = this.refreshTokens.get(form.get("refresh_token") ?? "");
-        if (!r || r.revoked) return this.send(res, 400, { status: "BAD_REFRESH_TOKEN", message: "missing or unknown refresh token" });
-        const access = `hat-${randomBytes(12).toString("hex")}`;
-        this.accessTokens.set(access, { hubId: r.hubId, scopes: r.scopes, expiresAt: Date.now() + this.accessTokenTtlSeconds * 1000 });
-        return this.send(res, 200, { access_token: access, refresh_token: form.get("refresh_token"), expires_in: this.accessTokenTtlSeconds, token_type: "bearer" });
+      if (method === "POST" && path === "/oauth/2026-03/token/introspect") {
+        if (this.introspection.malformed) return this.send(res, 200, { hello: "world" });
+        if (form.get("token_type_hint") !== "access_token") return oauthError(400, "invalid_request", "BAD_REQUEST");
+        const t = this.accessTokens.get(form.get("token") ?? "");
+        if (!t || t.expiresAt <= Date.now()) return this.send(res, 200, { active: false, ...this.introspection.overrides });
+        return this.send(res, 200, {
+          active: true,
+          token: form.get("token"),
+          hub_id: Number(t.hubId),
+          user_id: 222222,
+          client_id: FAKE_HUBSPOT_CLIENT_ID,
+          app_id: 1234444,
+          user: "admin@buyer.test",
+          hub_domain: "portal.hubspot.test",
+          scopes: t.scopes,
+          signed_access_token: { expiresAt: t.expiresAt, hubId: Number(t.hubId), signature: "sig", isUserLevel: false, isPrivateDistribution: true },
+          expires_in: Math.floor((t.expiresAt - Date.now()) / 1000),
+          is_private_distribution: true,
+          token_use: "access_token",
+          token_type: "Bearer",
+          ...this.introspection.overrides,
+        });
       }
-      return this.send(res, 400, { status: "BAD_GRANT_TYPE" });
-    }
-    const tokenInfo = path.match(/^\/oauth\/v1\/access-tokens\/(.+)$/);
-    if (method === "GET" && tokenInfo) {
-      const t = this.accessTokens.get(tokenInfo[1]!);
-      if (!t) return this.send(res, 404, { status: "error", category: "OBJECT_NOT_FOUND" });
-      return this.send(res, 200, { hub_id: Number(t.hubId), scopes: t.scopes, user: "admin@buyer.test", hub_domain: "portal.hubspot.test", token_type: "access" });
+      this.unexpected.push(`${method} ${path}`);
+      return this.send(res, 404, { status: "error", category: "OBJECT_NOT_FOUND" });
     }
 
     // CRM (authenticated)
@@ -272,13 +325,29 @@ export class FakeHubSpot {
     if (method === "GET" && path === "/crm/v3/owners") {
       return this.send(res, 200, { results: this.owners.filter((o) => !o.archived) }, headers);
     }
-    if (method === "GET" && path === "/crm/v3/pipelines/deals") {
+    if (method === "GET" && path === "/crm/pipelines/2026-09/deals") {
+      const ts = "2026-01-01T00:00:00Z";
       return this.send(res, 200, {
         results: this.pipelines.map((p, i) => ({
+          archived: p.archived ?? false,
+          createdAt: ts,
+          updatedAt: ts,
+          displayOrder: i,
           id: p.id,
           label: p.label,
-          displayOrder: i,
-          stages: p.stages.map((s, j) => ({ id: s.id, label: s.label, displayOrder: j, metadata: { isClosed: String(s.isClosed), probability: String(s.probability) } })),
+          stages: p.stages.map((s, j) => ({
+            archived: false,
+            createdAt: ts,
+            updatedAt: ts,
+            displayOrder: j,
+            id: s.id,
+            label: s.label,
+            metadata: {
+              ...(s.isClosed === undefined ? {} : { isClosed: String(s.isClosed) }),
+              ...(s.probability === undefined ? {} : { probability: s.probability.toFixed(1) }),
+            },
+            writePermissions: "CRM_PERMISSIONS_ENFORCEMENT",
+          })),
         })),
       }, headers);
     }

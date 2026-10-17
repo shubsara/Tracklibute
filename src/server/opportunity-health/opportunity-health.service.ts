@@ -30,6 +30,8 @@ import { type Tx, withOrgScope } from "@/server/db/org-scope";
  *     resolve), metadata-only evidence validated against an allow-list
  *   → deals that closed / disappeared: recommendation resolved, health removed
  *
+ * Deals whose open/closed status is unknown are skipped (counted, not judged).
+ *
  * Read-only towards HubSpot: this run makes no provider calls at all.
  */
 export const STALE_RUN_MS = 15 * 60_000;
@@ -43,6 +45,8 @@ export interface OpportunityHealthRunResult {
   needsAttention: number;
   atRisk: number;
   limitedSignal: number;
+  /** Open, non-archived deals NOT evaluated because their open/closed status is unknown. */
+  skippedUnknownStatus: number;
   created: number;
   refreshed: number;
   reopened: number;
@@ -149,6 +153,7 @@ export async function runOpportunityHealth(auth: AuthContext, opts: OpportunityH
     needsAttention: 0,
     atRisk: 0,
     limitedSignal: 0,
+    skippedUnknownStatus: 0,
     created: 0,
     refreshed: 0,
     reopened: 0,
@@ -172,6 +177,13 @@ export async function runOpportunityHealth(auth: AuthContext, opts: OpportunityH
           companies: { select: { company: { select: { domain: true } } } },
         },
       });
+      // Deals whose open/closed status is unknown (stage metadata unavailable):
+      // never evaluated, and their existing recommendations are left untouched
+      // (neither refreshed nor resolved) so nothing misleading is produced.
+      const unknown = await tx.crmDeal.findMany({
+        where: { organizationId: auth.organizationId, integrationId, isClosed: null, archivedAt: null },
+        select: { id: true },
+      });
       const owners = await tx.crmOwner.findMany({
         where: { organizationId: auth.organizationId, integrationId, mapping: { isNot: null } },
         select: { externalId: true, mapping: { select: { userId: true } } },
@@ -193,11 +205,13 @@ export async function runOpportunityHealth(auth: AuthContext, opts: OpportunityH
         email,
         recByKey: new Map(recs.map((r) => [r.dedupeKey!, r])),
         recs,
+        unknownIds: new Set(unknown.map((d) => d.id)),
         priorState: new Map(health.map((h) => [h.dealId, h.state])),
       };
     });
 
     const openIds = new Set(data.deals.map((d) => d.id));
+    result.skippedUnknownStatus = data.unknownIds.size;
     for (let i = 0; i < data.deals.length; i += WRITE_CHUNK) {
       const chunk = data.deals.slice(i, i + WRITE_CHUNK);
       await withOrgScope(auth, async (tx) => {
@@ -285,7 +299,7 @@ export async function runOpportunityHealth(auth: AuthContext, opts: OpportunityH
     // Deals no longer open (closed won/lost, archived, removed): resolve + drop health.
     await withOrgScope(auth, async (tx) => {
       for (const rec of data.recs) {
-        if (rec.status === "RESOLVED" || (rec.dealId && openIds.has(rec.dealId))) continue;
+        if (rec.status === "RESOLVED" || (rec.dealId && (openIds.has(rec.dealId) || data.unknownIds.has(rec.dealId)))) continue;
         await resolveRecommendation(tx, auth, rec.id, now, actor, "deal_closed_or_removed");
         result.resolved++;
       }

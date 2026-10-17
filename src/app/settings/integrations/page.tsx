@@ -26,6 +26,8 @@ const HUBSPOT_NOTICES: Record<string, string> = {
   invalid_state: "The HubSpot connection request expired. Please try again.",
   forbidden: "Only an admin can connect HubSpot.",
   permissions: "HubSpot didn't grant the required read-only permissions (or the app requests write access). Nothing was stored.",
+  app_config: "This HubSpot app can't be used: it must be an account-level app issued for Tracklibute's client ID. Nothing was stored.",
+  not_configured: "HubSpot rejected or is missing Tracklibute's app credentials. An operator must check the HubSpot app configuration.",
   connect_failed: "We couldn't connect HubSpot. Please try again.",
 };
 
@@ -56,7 +58,17 @@ export default async function IntegrationsPage({ searchParams }: { searchParams:
               <dt className="text-neutral-500">Open deals</dt>
               <dd>
                 {hubspot.openDeals} of {hubspot.deals}
+                {hubspot.unknownStatusDeals > 0 && ` (${hubspot.unknownStatusDeals} with unknown open/closed status)`}
               </dd>
+              {hubspot.pipelineMetadataStatus === "UNAVAILABLE" && (
+                <>
+                  <dt className="text-neutral-500">Pipelines</dt>
+                  <dd className="text-amber-700">
+                    HubSpot pipeline stages couldn&apos;t be read ({hubspot.pipelineMetadataError ?? "unknown reason"}). Deals still sync;
+                    deals whose open/closed status can&apos;t be determined are left out of Opportunity Health.
+                  </dd>
+                </>
+              )}
               <dt className="text-neutral-500">Owners</dt>
               <dd>
                 {hubspot.owners} ({hubspot.unmappedOwners} not mapped) · <Link href="/settings/crm-owners" className="underline">mapping</Link>

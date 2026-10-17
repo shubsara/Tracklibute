@@ -122,9 +122,12 @@ export function mapStages(res: z.infer<typeof hubspotPipelinesSchema>): CrmStage
   return res.results.flatMap((pipeline) =>
     pipeline.stages.map((s) => {
       const meta = s.metadata ?? {};
-      const isClosed = String(meta.isClosed ?? "false") === "true";
-      const probability = Number(meta.probability);
-      const hasProbability = meta.probability !== undefined && Number.isFinite(probability);
+      // Deal stage metadata carries string flags ("true"/"false"); anything
+      // else — including a missing key — leaves closed-ness unknown.
+      const closedFlag = typeof meta.isClosed === "boolean" ? String(meta.isClosed) : meta.isClosed;
+      const isClosed = closedFlag === "true" ? true : closedFlag === "false" ? false : null;
+      const probability = typeof meta.probability === "string" || typeof meta.probability === "number" ? Number(meta.probability) : NaN;
+      const hasProbability = Number.isFinite(probability);
       return {
         pipelineExternalId: pipeline.id,
         pipelineLabel: text(pipeline.label) ?? pipeline.id,
@@ -132,7 +135,7 @@ export function mapStages(res: z.infer<typeof hubspotPipelinesSchema>): CrmStage
         label: text(s.label) ?? s.id,
         displayOrder: s.displayOrder ?? 0,
         isClosed,
-        isWon: isClosed && hasProbability ? probability >= 1 : null,
+        isWon: isClosed === true && hasProbability ? probability >= 1 : null,
         probability: hasProbability ? Math.min(1, Math.max(0, probability)) : null,
       };
     }),

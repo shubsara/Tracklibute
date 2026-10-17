@@ -5,6 +5,8 @@ import { GET as hubspotConnect } from "@/app/api/integrations/hubspot/connect/ro
 import { DELETE as hubspotDisconnect, GET as hubspotStatus } from "@/app/api/integrations/hubspot/route";
 import type { AuthContext } from "@/domain/auth/auth-context";
 import { disconnectAppDb } from "@/server/db/client";
+import { HubSpotIntegrationAdapter } from "@/server/integrations/hubspot/hubspot.adapter";
+import { setHubSpotIntegrationAdapter } from "@/server/integrations/hubspot/hubspot-connection.service";
 import { syncHubSpot } from "@/server/integrations/hubspot/hubspot-sync.service";
 import { loadIntegrationCredentials } from "@/server/integrations/integrations.service";
 
@@ -138,7 +140,7 @@ describe("tokens", () => {
     const creds = (await loadIntegrationCredentials(o.members.ADMIN, integrationId)) as { accessToken: string; refreshToken: string };
     expect(creds.accessToken).not.toBe(tokens.accessToken);
     expect(creds.refreshToken).toBe(tokens.refreshToken);
-    expect(hubspot.requests).toContain("POST /oauth/v3/token");
+    expect(hubspot.requests).toContain("POST /oauth/2026-03/token");
   });
 
   it("a revoked grant (app uninstalled) → REAUTH_REQUIRED, audited once", async () => {
@@ -166,5 +168,86 @@ describe("disconnect", () => {
     const row = await ownerDb().integration.findUniqueOrThrow({ where: { id: integrationId } });
     expect(row).toMatchObject({ status: "DISCONNECTED", encryptedCredentials: null, syncCursor: null });
     expect(await ownerDb().crmDeal.count({ where: { integrationId } })).toBe(0);
+  });
+});
+
+describe("OAuth 2026-03 compatibility", () => {
+  const reset = () => {
+    hubspot.introspection = {};
+    hubspot.tokenResponseExtra = {};
+    hubspot.failures = [];
+  };
+
+  it("connect uses /oauth/2026-03/token + /token/introspect; no secret ever appears in a URL; nothing legacy is called", async () => {
+    reset();
+    const o = await createOrgFixture("hs2603");
+    hubspot.urls = [];
+    hubspot.oauthBodies = [];
+    const res = await connect(o.members.ADMIN, { hubId: "260301" });
+    expect(res.headers.get("location")).toBe("/settings/integrations?hubspot=connected");
+    const oauthCalls = hubspot.urls.filter((u) => u.includes("/oauth/"));
+    expect(oauthCalls).toEqual(["POST /oauth/2026-03/token", "POST /oauth/2026-03/token/introspect"]);
+    expect(hubspot.urls.join("\n")).not.toMatch(/access-tokens|\/oauth\/v1|\/oauth\/v3|code=|client_secret|hat-|hrt-/);
+    expect(hubspot.oauthBodies.every((b) => b.includes("client_secret="))).toBe(true);
+  });
+
+  it("an inactive token at introspection refuses the connection; nothing is stored", async () => {
+    reset();
+    const o = await createOrgFixture("hsinactive");
+    hubspot.introspection = { overrides: { active: false } };
+    const res = await connect(o.members.ADMIN);
+    expect(res.headers.get("location")).toBe("/settings/integrations?hubspot=connect_failed");
+    expect(await orgRow(o.organizationId)).toBeNull();
+  });
+
+  it("a user-level app or a token issued to another client is refused as an app-configuration problem", async () => {
+    reset();
+    const a = await createOrgFixture("hsuserlevel");
+    hubspot.introspection = { overrides: { signed_access_token: { isUserLevel: true } } };
+    expect((await connect(a.members.ADMIN)).headers.get("location")).toBe("/settings/integrations?hubspot=app_config");
+    expect(await orgRow(a.organizationId)).toBeNull();
+    const b = await createOrgFixture("hsclient");
+    hubspot.introspection = { overrides: { client_id: "another-app" } };
+    expect((await connect(b.members.ADMIN)).headers.get("location")).toBe("/settings/integrations?hubspot=app_config");
+    expect(await orgRow(b.organizationId)).toBeNull();
+    reset();
+  });
+
+  it("a malformed introspection response or network failure fails safely without leaking secrets", async () => {
+    reset();
+    const o = await createOrgFixture("hsmalformed");
+    hubspot.introspection = { malformed: true };
+    const logs = captureConsole();
+    try {
+      expect((await connect(o.members.ADMIN)).headers.get("location")).toBe("/settings/integrations?hubspot=connect_failed");
+      reset();
+      setHubSpotIntegrationAdapter(new HubSpotIntegrationAdapter({ fetchImpl: (async () => { throw new TypeError("fetch failed"); }) as unknown as typeof fetch }));
+      expect((await connect(o.members.ADMIN)).headers.get("location")).toBe("/settings/integrations?hubspot=connect_failed");
+    } finally {
+      setHubSpotIntegrationAdapter(new HubSpotIntegrationAdapter());
+      logs.restore();
+    }
+    expect(await orgRow(o.organizationId)).toBeNull();
+    expect(logs.lines.join("\n")).not.toMatch(/hat-|hrt-|code-[0-9a-f]{10}|fake-hubspot-client-secret|client_secret/);
+  });
+
+  it("refresh: app credentials rejected (invalid_client) is a config error — the integration stays CONNECTED", async () => {
+    reset();
+    const o = await createOrgFixture("hsinvclient");
+    // A 1-second token is inside the refresh skew, so the sync must refresh first.
+    const { integrationId } = await connectHubSpotFixture(hubspot, o.members.ADMIN, "2611", { expiresInSeconds: 1 });
+    hubspot.fail(/^\/oauth\/2026-03\/token$/, 401, 1, { error: "invalid_client", error_description: "bad client", status: "BAD_CLIENT_ID" });
+    await expect(syncHubSpot(o.members.ADMIN, { trigger: "manual" })).rejects.toMatchObject({ code: "service_unavailable" });
+    expect((await ownerDb().integration.findUniqueOrThrow({ where: { id: integrationId } })).status).toBe("CONNECTED");
+    reset();
+  });
+
+  it("the adapter's connection check introspects the token", async () => {
+    reset();
+    const t = hubspot.issueTokens("2612");
+    const adapter = new HubSpotIntegrationAdapter();
+    expect(await adapter.checkConnection(t)).toEqual({ ok: true });
+    hubspot.revokeAll();
+    expect(await adapter.checkConnection(t)).toMatchObject({ ok: false });
   });
 });

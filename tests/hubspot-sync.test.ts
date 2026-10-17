@@ -16,9 +16,11 @@ import { authedRequest as req } from "./support/requests";
 
 let hubspot: FakeHubSpot;
 let n = 0;
+let DEFAULT_PIPELINES: FakeHubSpot["pipelines"];
 
 beforeAll(async () => {
   hubspot = await startFakeHubSpotEnv();
+  DEFAULT_PIPELINES = structuredClone(hubspot.pipelines);
 });
 afterAll(async () => {
   await hubspot.stop();
@@ -37,6 +39,7 @@ async function setup() {
   hubspot.daily = null;
   hubspot.searchCap = 10_000;
   hubspot.searchPageSize = 200;
+  hubspot.pipelines = structuredClone(DEFAULT_PIPELINES);
   const org = await createOrgFixture(`hssync${n++}`);
   const admin = org.members.ADMIN;
   const { integrationId } = await connectHubSpotFixture(hubspot, admin, `90${n}`);
@@ -253,5 +256,81 @@ describe("cron", () => {
     expect(body.data.results.find((x: { integrationId: string }) => x.integrationId === integrationId)).toMatchObject({ outcome: "succeeded" });
     const audit = await ownerDb().auditLog.findFirst({ where: { entityId: integrationId, event: "hubspot.sync_completed" } });
     expect(audit?.actorType).toBe("SYSTEM");
+  });
+});
+
+describe("pipelines 2026-09 compatibility", () => {
+  const PIPELINES = /^\/crm\/pipelines\/2026-09\/deals$/;
+  const integrationCols = (id: string) =>
+    ownerDb().integration.findUniqueOrThrow({ where: { id }, select: { pipelineMetadataStatus: true, pipelineMetadataError: true, status: true } });
+
+  it("reads deal stages from GET /crm/pipelines/2026-09/deals (never the v1/v3 paths)", async () => {
+    const { admin, integrationId } = await setup();
+    hubspot.addDeal({ dealname: "Open", dealstage: "proposal" });
+    hubspot.requests = [];
+    const r = await syncHubSpot(admin, { trigger: "manual" });
+    expect(r).toMatchObject({ pipelineMetadata: "OK", dealsWithUnknownStage: 0, dealsClosedStatusUnknown: 0 });
+    expect(hubspot.requests).toContain("GET /crm/pipelines/2026-09/deals");
+    expect(hubspot.requests.some((q) => /\/crm\/v3\/pipelines|crm-pipelines\/v1/.test(q))).toBe(false);
+    expect(await integrationCols(integrationId)).toMatchObject({ pipelineMetadataStatus: "OK", pipelineMetadataError: null });
+    const stage = await ownerDb().crmPipelineStage.findFirstOrThrow({ where: { integrationId, externalId: "closedwon" } });
+    expect(stage).toMatchObject({ label: "Closed won", isClosed: true, isWon: true });
+  });
+
+  for (const [label, status, body, reason] of [
+    ["403 (not a missing scope)", 403, { status: "error", category: "FORBIDDEN" }, "forbidden"],
+    ["404", 404, { status: "error", category: "OBJECT_NOT_FOUND" }, "not_found"],
+    ["an unexpected shape", 200, { results: [{ nope: true }] }, "invalid_response"],
+  ] as const) {
+    it(`pipelines ${label}: deals still sync, nothing is invented, unknown status is explicit`, async () => {
+      const { admin, integrationId } = await setup();
+      hubspot.addDeal({ dealname: "Calculated open", hs_is_closed: "false" });
+      hubspot.addDeal({ dealname: "Calculated closed", hs_is_closed: "true" });
+      hubspot.addDeal({ dealname: "No signal" });
+      hubspot.fail(PIPELINES, status, 1, body);
+      const r = await syncHubSpot(admin, { trigger: "manual" });
+      expect(r).toMatchObject({ outcome: "completed", pipelineMetadata: "UNAVAILABLE", dealsUpserted: 3, dealsWithUnknownStage: 3, dealsClosedStatusUnknown: 1 });
+      expect(await integrationCols(integrationId)).toEqual({ pipelineMetadataStatus: "UNAVAILABLE", pipelineMetadataError: reason, status: "CONNECTED" });
+      expect(await ownerDb().crmPipelineStage.count({ where: { integrationId } })).toBe(0); // no invented stages
+      const rows = Object.fromEntries((await deals(integrationId)).map((d) => [d.name, d.isClosed]));
+      expect(rows).toEqual({ "Calculated open": false, "Calculated closed": true, "No signal": null });
+    });
+  }
+
+  it("keeps the last stage metadata HubSpot returned when a later fetch fails, and recovers to OK", async () => {
+    const { admin, integrationId } = await setup();
+    hubspot.addDeal({ dealname: "Won", dealstage: "closedwon" });
+    await syncHubSpot(admin, { trigger: "manual" });
+    hubspot.fail(PIPELINES, 403, 1, { status: "error", category: "FORBIDDEN" });
+    const r = await syncHubSpot(admin, { trigger: "manual", forceFull: true });
+    expect(r).toMatchObject({ pipelineMetadata: "UNAVAILABLE", dealsWithUnknownStage: 0 });
+    expect(await ownerDb().crmPipelineStage.count({ where: { integrationId } })).toBe(4);
+    expect((await deals(integrationId))[0]!.isClosed).toBe(true);
+    await syncHubSpot(admin, { trigger: "manual", forceFull: true });
+    expect(await integrationCols(integrationId)).toMatchObject({ pipelineMetadataStatus: "OK", pipelineMetadataError: null });
+  });
+
+  it("a stage whose metadata omits isClosed is stored as unknown, and its deals are not guessed open", async () => {
+    const { admin, integrationId } = await setup();
+    hubspot.pipelines[0]!.stages.push({ id: "mystery", label: "Mystery" });
+    hubspot.addDeal({ dealname: "In mystery", dealstage: "mystery" });
+    const r = await syncHubSpot(admin, { trigger: "manual" });
+    expect(r).toMatchObject({ pipelineMetadata: "OK", dealsWithUnknownStage: 0, dealsClosedStatusUnknown: 1 });
+    expect((await ownerDb().crmPipelineStage.findFirstOrThrow({ where: { integrationId, externalId: "mystery" } })).isClosed).toBeNull();
+    expect((await deals(integrationId))[0]!.isClosed).toBeNull();
+  });
+
+  it("403 MISSING_SCOPES on pipelines still means the grant is insufficient → reconnect", async () => {
+    const { admin, integrationId } = await setup();
+    hubspot.fail(PIPELINES, 403, 1, { status: "error", category: "MISSING_SCOPES" });
+    await expect(syncHubSpot(admin, { trigger: "manual" })).rejects.toMatchObject({ code: "policy_violation" });
+    expect((await integrationCols(integrationId)).status).toBe("REAUTH_REQUIRED");
+  });
+
+  it("a transient pipelines outage fails the run (retry later) instead of degrading silently", async () => {
+    const { admin, integrationId } = await setup();
+    hubspot.fail(PIPELINES, 503, 10);
+    await expect(syncHubSpot(admin, { trigger: "manual" })).rejects.toMatchObject({ code: "upstream_error" });
+    expect((await integrationCols(integrationId)).pipelineMetadataStatus).toBeNull();
   });
 });

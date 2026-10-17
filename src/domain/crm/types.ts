@@ -19,7 +19,8 @@ export interface CrmStageRecord {
   readonly externalId: string;
   readonly label: string;
   readonly displayOrder: number;
-  readonly isClosed: boolean;
+  /** Null when HubSpot's stage metadata does not state it (never guessed). */
+  readonly isClosed: boolean | null;
   readonly isWon: boolean | null;
   readonly probability: number | null;
 }

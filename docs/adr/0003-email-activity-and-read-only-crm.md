@@ -59,3 +59,24 @@ one member's mail to another.
   calls.
 - **Signal is incomplete until mailboxes connect.** Detector precision depends
   on mailbox coverage, so limited signal is surfaced in the UI and evidence.
+
+## Amendment (HubSpot API compatibility, before real-portal testing)
+
+- **OAuth uses the date-versioned 2026-03 endpoints.**
+  - `POST /oauth/2026-03/token` and `POST /oauth/2026-03/token/introspect`
+    replace v1. v1 is deprecated, with sunset on Feb 16, 2027; it put tokens
+    in URL paths.
+  - Introspection must report an active access token issued to our client ID,
+    for a numeric portal, with exactly the read scopes.
+  - **User-level apps are refused:** HubSpot's user-level API support excludes
+    owners, association bulk reads and the v3 object/search endpoints the sync
+    relies on.
+- **Deal stages come from `GET /crm/pipelines/2026-09/deals`.**
+  - That endpoint accepts `crm.objects.deals.read`, among others.
+  - The Pipelines V1 sunset (Dec 4, 2026) concerns `/crm-pipelines/v1/…`, not
+    the v3 path we used; we still moved to the current version.
+- **Pipelines unavailable is an explicit state.**
+  - The integration's `pipeline_metadata_status` is set to `UNAVAILABLE`.
+    Stage closed-ness is never guessed.
+  - A deal with no usable stage metadata and no `hs_is_closed` has
+    `is_closed = NULL`. Opportunity Health skips it instead of judging it.

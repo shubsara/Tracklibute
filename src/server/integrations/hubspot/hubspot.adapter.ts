@@ -37,11 +37,11 @@ import {
 import {
   beginHubSpotAuthorization,
   exchangeHubSpotCode,
-  getHubSpotTokenInfo,
   HUBSPOT_REQUIRED_SCOPES,
   hubspotApiBaseUrl,
   type HubSpotCredentials,
   hubspotNeedsRefresh,
+  introspectHubSpotAccessToken,
   parseHubSpotCredentials,
   refreshHubSpotCredentials,
 } from "./hubspot.oauth";
@@ -124,7 +124,9 @@ export class HubSpotCrmSource implements CrmSource {
   }
 
   listDealStages(): Promise<readonly CrmStageRecord[]> {
-    return translate(async () => mapStages(parse(hubspotPipelinesSchema, await this.client.get("pipelines.deals", "/crm/v3/pipelines/deals"), "pipelines.deals")));
+    return translate(async () =>
+      mapStages(parse(hubspotPipelinesSchema, await this.client.get("pipelines.deals", "/crm/pipelines/2026-09/deals"), "pipelines.deals")),
+    );
   }
 
   listDeals(after?: string): Promise<CrmPage<CrmDealRecord>> {
@@ -305,7 +307,7 @@ export class HubSpotIntegrationAdapter implements IntegrationAdapter {
 
   async checkConnection(raw: DecryptedCredentials): Promise<ConnectionHealth> {
     try {
-      await getHubSpotTokenInfo(parseHubSpotCredentials(raw).accessToken, this.opts.fetchImpl);
+      await introspectHubSpotAccessToken(parseHubSpotCredentials(raw).accessToken, this.opts.fetchImpl);
       return { ok: true };
     } catch {
       return { ok: false, detail: "error" };

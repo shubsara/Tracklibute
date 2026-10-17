@@ -47,7 +47,10 @@ describe("initial sync", () => {
 
     const r = await syncGmailMailbox(auth, { trigger: "manual" });
     expect(r).toMatchObject({ syncType: "initial", messagesUpserted: 3, threadsTouched: 2, cursorBefore: null });
-    expect(google.requests.some((q) => q.includes(`after%3A${Math.floor(daysAgo(90).getTime() / 1000)}`.slice(0, 18)))).toBe(true);
+    // The sync computes "90 days ago" before this line runs; allow a few seconds of clock movement.
+    const afterEpochs = google.requests.flatMap((q) => [...q.matchAll(/after%3A(\d+)/g)].map((m) => Number(m[1])));
+    const expected = Math.floor(daysAgo(90).getTime() / 1000);
+    expect(afterEpochs.some((e) => Math.abs(e - expected) <= 5)).toBe(true);
     expect(await counts(integrationId)).toEqual({ messages: 3, threads: 2 });
 
     const ta = await ownerDb().emailThread.findFirstOrThrow({ where: { integrationId, externalThreadId: "TA" }, include: { messages: { include: { recipients: true }, orderBy: { receivedAt: "asc" } } } });
