@@ -230,9 +230,12 @@ curl -X POST -H "Authorization: Bearer $GMAIL_SYNC_CRON_SECRET" localhost:3000/a
 pnpm typecheck && pnpm lint && pnpm test && pnpm build
 ```
 
-Tests run against `tracklibute_test` and never call real Google. `tests/support/fake-google.ts`
-is an in-process fake of Google's OIDC discovery, JWKS, token and revoke endpoints
-and the Gmail REST API, with failure injection.
+Tests run against `tracklibute_test` and never call real Google or HubSpot.
+`tests/support/fake-google.ts` is an in-process fake of Google's OIDC discovery,
+JWKS, token and revoke endpoints and the Gmail REST API, with failure injection.
+`tests/support/fake-hubspot.ts` fakes the HubSpot OAuth 2026-03 and CRM read
+endpoints Tracklibute uses, records every request, and is used to prove that no
+write request is ever sent. There is no CI configured yet: run these gates locally.
 
 | Suite | Proves |
 |---|---|
@@ -243,6 +246,13 @@ and the Gmail REST API, with failure injection.
 | `gmail-sync-resume` | Pacing under the emulated 6,000-units/min quota (zero 429s), exponential backoff recovery, partial vs failed outcomes, resume without re-fetch, original-checkpoint correctness across runs, deadline time-box, sibling cancellation, diagnostics |
 | `email-isolation` | Org A vs B **and** member vs member in one org, at app and RLS layers. URL/body tampering, composite FKs, cron secret, member removal. |
 | `security` | No tokens, codes or bodies in responses, logs or audit. RLS on every table. Composite FKs. Email content triggers nothing. |
+| `hubspot-oauth` | Read-only scopes, OAuth 2026-03 token + introspection, secrets never in URLs, user-level / foreign-client / write-scope grants refused, refresh, reauth, disconnect |
+| `hubspot-sync` | Full and incremental sync, 10k search re-anchor, archiving, resume, rate limits, Pipelines 2026-09 and its UNAVAILABLE fallback, zero write requests |
+| `crm-isolation` | RLS on every CRM table, cross-tenant writes refused, owner-mapping authorization |
+| `email-activity` | Content-free derivation, eligibility rules, rebuild, member-readable but owner-writable rows |
+| `opportunity-health` | Deterministic states and reasons, dedupe, recommendation lifecycle, limited signal, unknown-status deals skipped |
+| `responsibility-install` | Onboarding installs SYSTEM responsibilities, idempotent repair route, post-sync health failures logged and surfaced |
+| `deal-detail-recommendations` | Open vs resolved recommendations on the deal detail page |
 | Foundation suites | Tenancy, approval gate, API, integrations, units |
 
 ---
@@ -566,10 +576,25 @@ PostgreSQL. Create a `tracklibute_app` role without `BYPASSRLS` before running
 - **HubSpot list associations** are taken as embedded in the deals list. A deal
   with more associations than HubSpot embeds per record may be incomplete
   until an incremental update fetches them via v4.
-- **Not yet verified against a real HubSpot portal:** the OAuth 2026-03
-  endpoints, introspection fields and Pipelines 2026-09 behaviour are
-  implemented from HubSpot's current documentation and tested against an
-  in-process fake only.
+- **HubSpot verification so far — developer test portal only.** On a
+  HubSpot *developer test portal* (portal `247756835`, one deal), the
+  following was checked manually end to end:
+  - OAuth connection (2026-03 token + introspection) succeeded.
+  - The deal synced, and an associated contact appeared in Tracklibute.
+  - Opportunity Health flagged the deal while no next activity was scheduled.
+  - After a next activity was scheduled in HubSpot and synced, the deal became
+    Healthy and its recommendation moved from Open to Resolved.
+  - The deal detail page no longer shows the resolved recommendation as an
+    active issue.
+
+  This is **not** a production-customer validation. These were not exercised
+  against real HubSpot and are covered only by the in-process fake (`tests/support/fake-hubspot.ts`):
+  - volume (many deals, owners or pipelines)
+  - the 10,000-result search re-anchor, rate-limit and daily-allowance handling
+  - the pipelines-unavailable degraded state
+  - user-level app refusal, and reauth after uninstall or revocation
+  - long-running token refresh
+  - email-activity matching between a real Gmail mailbox and HubSpot contacts
 - **Other CRM reads still use v3/v4 paths** (`/crm/v3/objects/*`,
   `/crm/v3/owners`, `/crm/v4/associations/*`). They are documented and
   supported for account-level apps, but HubSpot now lists them under its

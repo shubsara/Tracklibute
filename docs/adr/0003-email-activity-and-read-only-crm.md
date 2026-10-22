@@ -75,6 +75,9 @@ one member's mail to another.
   - That endpoint accepts `crm.objects.deals.read`, among others.
   - The Pipelines V1 sunset (Dec 4, 2026) concerns `/crm-pipelines/v1/…`, not
     the v3 path we used; we still moved to the current version.
+- **Manual check on a developer test portal (`247756835`):**
+  connect → sync → flag → resolve worked end to end with one deal. This is not
+  a production-customer validation; see the README's known limitations.
 - **Pipelines unavailable is an explicit state.**
   - The integration's `pipeline_metadata_status` is set to `UNAVAILABLE`.
     Stage closed-ness is never guessed.
