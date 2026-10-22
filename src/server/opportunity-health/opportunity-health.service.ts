@@ -13,7 +13,7 @@ import {
 import { assertMetadataOnlyEvidence, type OpportunityHealthEvidence } from "@/domain/opportunity-health/evidence";
 import { decideTransition, type RecommendationStatus } from "@/domain/recommendations/lifecycle";
 import { parseSystemConfig } from "@/domain/responsibilities/templates";
-import { ConflictError, NotFoundError, PolicyViolationError } from "@/lib/errors";
+import { AppError, ConflictError, NotFoundError, PolicyViolationError } from "@/lib/errors";
 import { log } from "@/lib/log";
 import { recordAudit } from "@/server/audit/audit-log";
 import { type Tx, withOrgScope } from "@/server/db/org-scope";
@@ -114,7 +114,9 @@ export async function runOpportunityHealth(auth: AuthContext, opts: OpportunityH
     const responsibility = await tx.responsibility.findFirst({
       where: { organizationId: auth.organizationId, templateKey: "opportunity_health" },
     });
-    if (!responsibility) throw new NotFoundError("The Opportunity Health responsibility is not installed");
+    if (!responsibility) {
+      throw new NotFoundError("The Opportunity Health responsibility is not installed. An admin can install it from Settings → Integrations.");
+    }
     if (responsibility.status !== "ACTIVE") throw new PolicyViolationError("Opportunity Health is paused");
     const integration = await tx.integration.findFirst({
       where: { organizationId: auth.organizationId, provider: "HUBSPOT", ownerUserId: null, status: "CONNECTED" },
@@ -321,16 +323,134 @@ export async function runOpportunityHealth(auth: AuthContext, opts: OpportunityH
     await withOrgScope(auth, (tx) =>
       tx.responsibilityRun.update({
         where: { id: run.id },
-        data: { status: "FAILED", finishedAt: new Date(), error: err instanceof Error ? err.name.slice(0, 100) : "error" },
+        data: { status: "FAILED", finishedAt: new Date(), error: safeErrorCode(err) },
       }),
     ).catch(() => undefined);
     log.error("opportunity_health.run_failed", {
       organizationId: auth.organizationId,
       runId: run.id,
+      errorCode: safeErrorCode(err),
       errorName: err instanceof Error ? err.name : typeof err,
     });
     throw err;
   }
+}
+
+/** Machine-readable, secret-free code for an error (AppError code, else the error class name). */
+function safeErrorCode(err: unknown): string {
+  if (err instanceof AppError) return err.code;
+  return (err instanceof Error ? err.name : "error").slice(0, 100);
+}
+
+export type PostSyncHealthOutcome =
+  | { status: "succeeded"; result: OpportunityHealthRunResult }
+  | { status: "skipped"; reason: "already_running" }
+  | { status: "failed"; errorCode: string; message: string };
+
+/**
+ * The Opportunity Health run that follows a completed HubSpot sync (manual,
+ * connect or cron). It never throws — the sync itself succeeded — but a
+ * failure is NOT swallowed: it is logged (structured, no secrets) and
+ * recorded as an `opportunity_health.post_sync_failed` audit event, which the
+ * HubSpot status surfaces to the organization until a later run succeeds.
+ * Another run already in progress is a benign skip.
+ */
+export async function runOpportunityHealthAfterSync(
+  auth: AuthContext,
+  trigger: "manual" | "cron" | "connect",
+): Promise<PostSyncHealthOutcome> {
+  try {
+    return { status: "succeeded", result: await runOpportunityHealth(auth, { trigger: "sync" }) };
+  } catch (err) {
+    if (err instanceof ConflictError) {
+      log.info("opportunity_health.post_sync_skipped", { organizationId: auth.organizationId, syncTrigger: trigger, reason: "already_running" });
+      return { status: "skipped", reason: "already_running" };
+    }
+    const errorCode = safeErrorCode(err);
+    // AppError messages are written to be client-safe; anything else gets a generic text.
+    const message = err instanceof AppError ? err.message : "Opportunity Health failed unexpectedly.";
+    log.error("opportunity_health.post_sync_failed", {
+      organizationId: auth.organizationId,
+      syncTrigger: trigger,
+      errorCode,
+      errorName: err instanceof Error ? err.name : typeof err,
+    });
+    await withOrgScope(auth, (tx) =>
+      recordAudit(
+        tx,
+        auth,
+        { event: "opportunity_health.post_sync_failed", entityType: "organization", entityId: auth.organizationId, metadata: { syncTrigger: trigger, errorCode, message } },
+        { actor: "SYSTEM" },
+      ),
+    ).catch((auditErr: unknown) => {
+      log.error("opportunity_health.post_sync_failure_not_recorded", {
+        organizationId: auth.organizationId,
+        errorName: auditErr instanceof Error ? auditErr.name : typeof auditErr,
+      });
+    });
+    return { status: "failed", errorCode, message };
+  }
+}
+
+export interface OpportunityHealthStatusDTO {
+  installed: boolean;
+  responsibilityId: string | null;
+  responsibilityStatus: "ACTIVE" | "PAUSED" | "ARCHIVED" | null;
+  lastRun: { status: string; startedAt: string | null; finishedAt: string | null; error: string | null; dealsEvaluated: number | null } | null;
+  /** The latest post-sync failure, if no run has succeeded since. */
+  lastFailure: { at: string; errorCode: string; message: string } | null;
+}
+
+/** Organization-readable status of the Opportunity Health responsibility. */
+export async function getOpportunityHealthStatus(auth: AuthContext): Promise<OpportunityHealthStatusDTO> {
+  return withOrgScope(auth, async (tx) => {
+    const responsibility = await tx.responsibility.findFirst({
+      where: { organizationId: auth.organizationId, templateKey: "opportunity_health" },
+      select: { id: true, status: true },
+    });
+    const [lastRun, lastSucceeded, failure] = await Promise.all([
+      responsibility
+        ? tx.responsibilityRun.findFirst({ where: { organizationId: auth.organizationId, responsibilityId: responsibility.id }, orderBy: { createdAt: "desc" } })
+        : null,
+      responsibility
+        ? tx.responsibilityRun.findFirst({
+            where: { organizationId: auth.organizationId, responsibilityId: responsibility.id, status: "SUCCEEDED" },
+            orderBy: { createdAt: "desc" },
+            select: { finishedAt: true, createdAt: true },
+          })
+        : null,
+      tx.auditLog.findFirst({
+        where: { organizationId: auth.organizationId, event: "opportunity_health.post_sync_failed" },
+        orderBy: { createdAt: "desc" },
+        select: { createdAt: true, metadata: true },
+      }),
+    ]);
+    const succeededAt = lastSucceeded ? (lastSucceeded.finishedAt ?? lastSucceeded.createdAt) : null;
+    const meta = (failure?.metadata ?? {}) as { errorCode?: unknown; message?: unknown };
+    const summary = (lastRun?.summary ?? null) as { dealsEvaluated?: unknown } | null;
+    return {
+      installed: responsibility !== null,
+      responsibilityId: responsibility?.id ?? null,
+      responsibilityStatus: responsibility?.status ?? null,
+      lastRun: lastRun
+        ? {
+            status: lastRun.status,
+            startedAt: lastRun.startedAt?.toISOString() ?? null,
+            finishedAt: lastRun.finishedAt?.toISOString() ?? null,
+            error: lastRun.error,
+            dealsEvaluated: typeof summary?.dealsEvaluated === "number" ? summary.dealsEvaluated : null,
+          }
+        : null,
+      lastFailure:
+        failure && (!succeededAt || failure.createdAt > succeededAt)
+          ? {
+              at: failure.createdAt.toISOString(),
+              errorCode: typeof meta.errorCode === "string" ? meta.errorCode : "error",
+              message: typeof meta.message === "string" ? meta.message : "Opportunity Health failed.",
+            }
+          : null,
+    };
+  });
 }
 
 async function resolveRecommendation(tx: Tx, auth: AuthContext, id: string, now: Date, actor: "USER" | "SYSTEM", reason: string) {

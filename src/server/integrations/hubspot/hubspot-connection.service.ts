@@ -8,6 +8,7 @@ import { recordAudit } from "@/server/audit/audit-log";
 import type { OAuthTransaction } from "@/server/auth/oauth-state";
 import { type Tx, withOrgScope } from "@/server/db/org-scope";
 import { encryptCredentialsFor } from "@/server/integrations/integrations.service";
+import { getOpportunityHealthStatus, type OpportunityHealthStatusDTO } from "@/server/opportunity-health/opportunity-health.service";
 
 import { HubSpotIntegrationAdapter } from "./hubspot.adapter";
 import { getHubSpotSettings } from "./hubspot.oauth";
@@ -35,6 +36,8 @@ export interface HubSpotStatusDTO {
   pipelineMetadataError: string | null;
   owners: number;
   unmappedOwners: number;
+  /** Whether Opportunity Health is installed, its last run and any unresolved post-sync failure. */
+  opportunityHealth: OpportunityHealthStatusDTO;
 }
 
 let adapter = new HubSpotIntegrationAdapter();
@@ -50,6 +53,7 @@ export async function findHubSpotIntegration(auth: AuthContext) {
 }
 
 export async function getHubSpotStatus(auth: AuthContext): Promise<HubSpotStatusDTO> {
+  const opportunityHealth = await getOpportunityHealthStatus(auth);
   return withOrgScope(auth, async (tx) => {
     const row = await tx.integration.findFirst({
       where: { organizationId: auth.organizationId, provider: "HUBSPOT", ownerUserId: null },
@@ -95,6 +99,7 @@ export async function getHubSpotStatus(auth: AuthContext): Promise<HubSpotStatus
       pipelineMetadataError: active ? row.pipelineMetadataError : null,
       owners,
       unmappedOwners,
+      opportunityHealth,
     };
   });
 }

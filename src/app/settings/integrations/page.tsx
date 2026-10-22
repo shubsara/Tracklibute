@@ -33,9 +33,23 @@ const HUBSPOT_NOTICES: Record<string, string> = {
 
 const fmt = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : "never");
 
-export default async function IntegrationsPage({ searchParams }: { searchParams: Promise<{ gmail?: string; hubspot?: string }> }) {
+const RESPONSIBILITY_NOTICES: Record<string, string> = {
+  installed: "Default responsibilities are installed.",
+  health_failed: "Default responsibilities are installed, but the Opportunity Health run failed — see the HubSpot card for details.",
+};
+
+export default async function IntegrationsPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ gmail?: string; hubspot?: string; responsibilities?: string }>;
+}) {
   const auth = await requirePageAuth();
-  const [status, hubspot, { gmail, hubspot: hubspotNotice }] = await Promise.all([getGmailStatus(auth), getHubSpotStatus(auth), searchParams]);
+  const [status, hubspot, { gmail, hubspot: hubspotNotice, responsibilities: respNotice }] = await Promise.all([
+    getGmailStatus(auth),
+    getHubSpotStatus(auth),
+    searchParams,
+  ]);
+  const oh = hubspot.opportunityHealth;
   const canConnect = auth.role !== "VIEWER";
   const isAdmin = hasRole(auth, "ADMIN");
 
@@ -44,6 +58,7 @@ export default async function IntegrationsPage({ searchParams }: { searchParams:
       <h1 className="text-2xl font-semibold">Integrations</h1>
       {gmail && NOTICES[gmail] && <p className="text-sm text-neutral-600">{NOTICES[gmail]}</p>}
       {hubspotNotice && HUBSPOT_NOTICES[hubspotNotice] && <p className="text-sm text-neutral-600">{HUBSPOT_NOTICES[hubspotNotice]}</p>}
+      {respNotice && RESPONSIBILITY_NOTICES[respNotice] && <p className="text-sm text-neutral-600">{RESPONSIBILITY_NOTICES[respNotice]}</p>}
 
       <div className="space-y-3 rounded border p-4">
         <h2 className="font-medium">HubSpot</h2>
@@ -80,6 +95,46 @@ export default async function IntegrationsPage({ searchParams }: { searchParams:
                 </>
               )}
             </dl>
+            <div className="space-y-2 border-t pt-3 text-sm">
+              <p className="font-medium">Opportunity Health</p>
+              {!oh.installed ? (
+                <p className="text-amber-700">Not installed — deals can&apos;t be evaluated until it is.</p>
+              ) : oh.responsibilityStatus !== "ACTIVE" ? (
+                <p className="text-amber-700">Installed but {oh.responsibilityStatus?.toLowerCase()}.</p>
+              ) : (
+                <p className="text-neutral-600">
+                  {oh.lastRun
+                    ? `Last run ${oh.lastRun.status.toLowerCase()}${oh.lastRun.finishedAt ? ` at ${fmt(oh.lastRun.finishedAt)}` : ""}${
+                        oh.lastRun.dealsEvaluated !== null ? ` · ${oh.lastRun.dealsEvaluated} deals evaluated` : ""
+                      }${oh.lastRun.error ? ` (${oh.lastRun.error})` : ""}`
+                    : "Not run yet."}
+                </p>
+              )}
+              {oh.lastFailure && (
+                <p className="text-amber-700">
+                  Last automatic run failed ({fmt(oh.lastFailure.at)}): {oh.lastFailure.message}
+                </p>
+              )}
+              {isAdmin && (
+                <div className="flex flex-wrap gap-2">
+                  {!oh.installed && (
+                    <form method="post" action="/api/responsibilities/system">
+                      <input type="hidden" name="runOpportunityHealth" value="true" />
+                      <button type="submit" className="rounded border px-3 py-1">
+                        Install default responsibilities &amp; run Opportunity Health
+                      </button>
+                    </form>
+                  )}
+                  {oh.installed && oh.responsibilityId && oh.responsibilityStatus === "ACTIVE" && (
+                    <form method="post" action={`/api/responsibilities/${oh.responsibilityId}/run`}>
+                      <button type="submit" className="rounded border px-3 py-1">
+                        Run Opportunity Health now
+                      </button>
+                    </form>
+                  )}
+                </div>
+              )}
+            </div>
             {isAdmin && <HubSpotActions />}
           </>
         ) : hubspot.status === "REAUTH_REQUIRED" ? (

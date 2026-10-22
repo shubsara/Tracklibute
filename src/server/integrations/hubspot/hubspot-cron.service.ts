@@ -4,7 +4,7 @@ import { getEnv } from "@/lib/env";
 import { log } from "@/lib/log";
 import { contextFromIdentity } from "@/server/auth/resolve";
 import { getAppDb } from "@/server/db/client";
-import { runOpportunityHealth } from "@/server/opportunity-health/opportunity-health.service";
+import { runOpportunityHealthAfterSync } from "@/server/opportunity-health/opportunity-health.service";
 
 import { syncHubSpot } from "./hubspot-sync.service";
 
@@ -14,7 +14,15 @@ export interface HubSpotCronSummary {
   partial: number;
   failed: number;
   skipped: number;
-  results: Array<{ integrationId: string; outcome: "succeeded" | "partial" | "failed" | "skipped"; dealsUpserted?: number; errorCode?: string }>;
+  results: Array<{
+    integrationId: string;
+    outcome: "succeeded" | "partial" | "failed" | "skipped";
+    dealsUpserted?: number;
+    errorCode?: string;
+    /** Post-sync Opportunity Health outcome (after a completed sync only). */
+    health?: "succeeded" | "skipped" | "failed";
+    healthErrorCode?: string;
+  }>;
 }
 
 /** Leave headroom below the route's maxDuration (300 s). */
@@ -53,8 +61,13 @@ export async function runHubSpotCronSync(opts: { limit?: number; totalBudgetMs?:
       const r = await syncHubSpot(auth, { trigger: "cron", deadlineAt: Math.min(deadline, Date.now() + perRunCap) });
       const outcome = r.outcome === "completed" ? "succeeded" : "partial";
       summary[outcome]++;
-      summary.results.push({ integrationId: c.integration_id, outcome, dealsUpserted: r.dealsUpserted });
-      if (r.outcome === "completed") await runOpportunityHealth(auth, { trigger: "sync" }).catch(() => undefined);
+      const entry: HubSpotCronSummary["results"][number] = { integrationId: c.integration_id, outcome, dealsUpserted: r.dealsUpserted };
+      if (r.outcome === "completed") {
+        const health = await runOpportunityHealthAfterSync(auth, "cron");
+        entry.health = health.status;
+        if (health.status === "failed") entry.healthErrorCode = health.errorCode;
+      }
+      summary.results.push(entry);
     } catch (err) {
       const code = errorCode(err);
       const outcome = code === "conflict" ? "skipped" : "failed";

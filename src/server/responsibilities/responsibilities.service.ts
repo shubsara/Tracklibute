@@ -33,38 +33,41 @@ export async function getResponsibility(auth: AuthContext, id: string): Promise<
   return row;
 }
 
-/** Idempotently create all SYSTEM responsibilities for the caller's organization. */
+/**
+ * Idempotently create every missing SYSTEM responsibility for the caller's
+ * organization (ADMIN+). Existing responsibilities — including their config
+ * and paused/archived status — are never touched. Safe under concurrency:
+ * `INSERT … ON CONFLICT DO NOTHING` on the (organization, template_key) unique
+ * key. Returns how many were created.
+ */
 export async function installSystemResponsibilities(auth: AuthContext): Promise<number> {
   requireRole(auth, "ADMIN");
   return withOrgScope(auth, async (tx) => {
-    let created = 0;
-    for (const key of SYSTEM_TEMPLATE_KEYS) {
-      const exists = await tx.responsibility.findFirst({
-        where: { organizationId: auth.organizationId, templateKey: key },
-        select: { id: true },
-      });
-      if (exists) continue;
-      const t = SYSTEM_RESPONSIBILITY_TEMPLATES[key];
-      const row = await tx.responsibility.create({
-        data: {
+    const created = await tx.responsibility.createManyAndReturn({
+      data: SYSTEM_TEMPLATE_KEYS.map((key) => {
+        const t = SYSTEM_RESPONSIBILITY_TEMPLATES[key];
+        return {
           organizationId: auth.organizationId,
           name: t.name,
           description: t.description,
-          type: "SYSTEM",
+          type: "SYSTEM" as const,
           templateKey: key,
           ownerUserId: auth.userId,
           config: defaultConfigFor(key) as Prisma.InputJsonValue,
-        },
-      });
+        };
+      }),
+      skipDuplicates: true,
+      select: { id: true, templateKey: true },
+    });
+    for (const row of created) {
       await recordAudit(tx, auth, {
         event: "responsibility.created",
         entityType: "responsibility",
         entityId: row.id,
-        metadata: { templateKey: key },
+        metadata: { templateKey: row.templateKey },
       });
-      created++;
     }
-    return created;
+    return created.length;
   });
 }
 

@@ -11,6 +11,7 @@ import { recordAudit } from "@/server/audit/audit-log";
 import type { SessionIdentity } from "@/server/auth/provider";
 import { getAppDb } from "@/server/db/client";
 import { withOrgScope } from "@/server/db/org-scope";
+import { installSystemResponsibilities } from "@/server/responsibilities/responsibilities.service";
 
 const createOrgInput = z.object({ name: z.string().trim().min(2).max(100) });
 
@@ -30,6 +31,9 @@ export function slugify(name: string): string {
  * Onboarding: a signed-in user with no organization creates one and becomes
  * OWNER; the session is bound to it atomically in the database. The user is
  * taken from the session — any organizationId/userId in the input is ignored.
+ * Every SYSTEM responsibility (incl. Opportunity Health) is installed right
+ * away. If that step fails the organization still exists; the failure is
+ * logged and an ADMIN can install them later (POST /api/responsibilities/system).
  */
 export async function createOrganizationForSession(
   identity: SessionIdentity | null,
@@ -66,5 +70,14 @@ export async function createOrganizationForSession(
     }),
   );
   log.info("organization.created", { organizationId, userId: identity.userId });
+  try {
+    const installed = await installSystemResponsibilities(auth);
+    log.info("organization.responsibilities_installed", { organizationId, installed });
+  } catch (err) {
+    log.error("organization.responsibility_install_failed", {
+      organizationId,
+      errorName: err instanceof Error ? err.name : typeof err,
+    });
+  }
   return { ...auth, slug, name: parsed.data.name };
 }

@@ -9,7 +9,7 @@ import { getAuthContext } from "@/server/auth/resolve";
 import { redirect } from "@/server/http/route";
 import { completeHubSpotConnect } from "@/server/integrations/hubspot/hubspot-connection.service";
 import { syncHubSpot } from "@/server/integrations/hubspot/hubspot-sync.service";
-import { runOpportunityHealth } from "@/server/opportunity-health/opportunity-health.service";
+import { runOpportunityHealthAfterSync } from "@/server/opportunity-health/opportunity-health.service";
 
 export const dynamic = "force-dynamic";
 // The first sync runs in `after()` within this route's duration; it is
@@ -20,7 +20,12 @@ const SETTINGS = "/settings/integrations";
 
 function runAfterResponse(task: () => Promise<unknown>): void {
   try {
-    after(() => task().catch(() => undefined));
+    after(() =>
+      task().catch((err: unknown) => {
+        // syncHubSpot already logs + records its own failure; keep a breadcrumb here too.
+        log.warn("hubspot.initial_sync_failed", { errorName: err instanceof Error ? err.name : typeof err });
+      }),
+    );
   } catch {
     log.info("hubspot.initial_sync_deferred", {});
   }
@@ -51,7 +56,7 @@ export async function GET(request: Request): Promise<Response> {
     if (result.isFirstConnection) {
       runAfterResponse(async () => {
         const r = await syncHubSpot(auth, { trigger: "connect" });
-        if (r.outcome === "completed") await runOpportunityHealth(auth, { trigger: "sync" });
+        if (r.outcome === "completed") await runOpportunityHealthAfterSync(auth, "connect");
       });
     }
     return redirect(`${SETTINGS}?hubspot=connected`, 303, [clearTx]);

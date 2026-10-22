@@ -427,6 +427,16 @@ Google's limits (Usage limits page, updated 2026-09-10):
   - Resolved items reopen as a new episode.
   - Snooze, dismiss and accept go through the action registry as internal,
     non-consequential actions.
+- **Installation:** onboarding installs every SYSTEM responsibility,
+  including Opportunity Health. Organizations created before that fix can be
+  repaired by an ADMIN with `POST /api/responsibilities/system` (optionally
+  `{"runOpportunityHealth": true}`), or with the *Install default
+  responsibilities* button on Settings → Integrations. The repair is
+  idempotent and doesn't touch existing responsibilities, connections or data.
+- **Post-sync failures are visible:** a health run that fails after a
+  completed HubSpot sync is logged (`opportunity_health.post_sync_failed`),
+  audited, and shown on the HubSpot card until a later run succeeds. It is
+  never silently swallowed.
 - **When it runs:** after each completed HubSpot sync, on
   `POST /api/internal/cron/opportunity-health`, or manually by an ADMIN. Only
   one run per organization can be active (DB partial unique index); stale runs
