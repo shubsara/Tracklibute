@@ -15,8 +15,8 @@ import type { IntegrationProviderKey } from "@/domain/integrations/providers";
  * Config objects are flat, typed parameters — deliberately NOT rules,
  * conditions, or step lists. There is no workflow builder.
  *
- * Foundation defines templates only. Detection logic for each arrives in its
- * own spec after Gmail / HubSpot / Calendar data exists.
+ * Detection logic arrives per template in its own spec. Opportunity Health is
+ * implemented (Build Spec 03): deterministic, HubSpot + Gmail only.
  */
 export const SYSTEM_TEMPLATE_KEYS = [
   "lead_health",
@@ -56,11 +56,14 @@ export const SYSTEM_RESPONSIBILITY_TEMPLATES = {
     key: "opportunity_health",
     name: "Opportunity Health",
     description: "Detect active opportunities that are going quiet, slipping, or missing a next step.",
-    requiredProviders: ["HUBSPOT", "GMAIL", "GOOGLE_CALENDAR"],
+    // HubSpot is mandatory; Gmail adds the activity signal. Calendar is not used.
+    requiredProviders: ["HUBSPOT", "GMAIL"],
     configSchema: z
       .object({
         inactiveAfterDays: days(7),
         flagPastCloseDate: z.boolean().default(true),
+        awaitingReplyAfterDays: days(2),
+        flagMissingNextActivity: z.boolean().default(true),
       })
       .strict(),
   },

@@ -8,9 +8,10 @@ Opportunity Health, Follow-up, CRM Hygiene and Meeting Readiness. It watches
 Gmail, HubSpot and Google Calendar, raises **Recommendations**, and proposes
 **Actions** that a human approves before anything consequential happens.
 
-> **Current stage: Build Spec 02.** This stage adds production authentication,
-> Gmail OAuth, Gmail ingestion and normalized, owner-private email context.
-> There is no AI, no detection logic and no email sending yet.
+> **Current stage: Build Spec 03.** This stage adds a read-only HubSpot mirror,
+> a content-free, organization-readable EmailActivity layer, and the first
+> deterministic responsibility: **Opportunity Health**. There is no AI, no
+> scoring, no CRM writes, no Calendar and no email sending.
 
 ---
 
@@ -152,6 +153,11 @@ Databases: `tracklibute_dev` (development) and `tracklibute_test` (tests only).
 | `GMAIL_SYNC_LOOKBACK_DAYS` | | Initial and recovery backfill window, 1–365 (default **90**) |
 | `GMAIL_QUOTA_UNITS_PER_SECOND` | | Gmail quota pacing per mailbox (default **80**; Google allows 100/s) |
 | `GMAIL_SYNC_RUN_BUDGET_SECONDS` | | Max seconds per sync run before ending as *partial* (default **210**) |
+| `HUBSPOT_CLIENT_ID` / `HUBSPOT_CLIENT_SECRET` | for HubSpot | HubSpot app (OAuth) credentials. Without them HubSpot returns 503 "not configured". |
+| `HUBSPOT_REDIRECT_URI` | for HubSpot | Must exactly match the app's redirect URL (`…/api/integrations/hubspot/callback`) |
+| `HUBSPOT_REQUESTS_PER_10S` | | Client-side pacing (default **90**; HubSpot allows 110 / 10 s per installed app) |
+| `HUBSPOT_SYNC_RUN_BUDGET_SECONDS` | | Max seconds per HubSpot sync run before ending as *partial* (default **240**) |
+| `CRON_SECRET` | for cron | ≥ 32 chars. Bearer secret for `/api/internal/cron/hubspot-sync` and `/api/internal/cron/opportunity-health` |
 | `DEV_AUTH_ENABLED` | | `true` enables dev login. Always refused when `NODE_ENV=production`. |
 
 Tests read `.env.test`: the same keys, pointing at `tracklibute_test`. Create it with
@@ -224,9 +230,12 @@ curl -X POST -H "Authorization: Bearer $GMAIL_SYNC_CRON_SECRET" localhost:3000/a
 pnpm typecheck && pnpm lint && pnpm test && pnpm build
 ```
 
-Tests run against `tracklibute_test` and never call real Google. `tests/support/fake-google.ts`
-is an in-process fake of Google's OIDC discovery, JWKS, token and revoke endpoints
-and the Gmail REST API, with failure injection.
+Tests run against `tracklibute_test` and never call real Google or HubSpot.
+`tests/support/fake-google.ts` is an in-process fake of Google's OIDC discovery,
+JWKS, token and revoke endpoints and the Gmail REST API, with failure injection.
+`tests/support/fake-hubspot.ts` fakes the HubSpot OAuth 2026-03 and CRM read
+endpoints Tracklibute uses, records every request, and is used to prove that no
+write request is ever sent. There is no CI configured yet: run these gates locally.
 
 | Suite | Proves |
 |---|---|
@@ -237,6 +246,13 @@ and the Gmail REST API, with failure injection.
 | `gmail-sync-resume` | Pacing under the emulated 6,000-units/min quota (zero 429s), exponential backoff recovery, partial vs failed outcomes, resume without re-fetch, original-checkpoint correctness across runs, deadline time-box, sibling cancellation, diagnostics |
 | `email-isolation` | Org A vs B **and** member vs member in one org, at app and RLS layers. URL/body tampering, composite FKs, cron secret, member removal. |
 | `security` | No tokens, codes or bodies in responses, logs or audit. RLS on every table. Composite FKs. Email content triggers nothing. |
+| `hubspot-oauth` | Read-only scopes, OAuth 2026-03 token + introspection, secrets never in URLs, user-level / foreign-client / write-scope grants refused, refresh, reauth, disconnect |
+| `hubspot-sync` | Full and incremental sync, 10k search re-anchor, archiving, resume, rate limits, Pipelines 2026-09 and its UNAVAILABLE fallback, zero write requests |
+| `crm-isolation` | RLS on every CRM table, cross-tenant writes refused, owner-mapping authorization |
+| `email-activity` | Content-free derivation, eligibility rules, rebuild, member-readable but owner-writable rows |
+| `opportunity-health` | Deterministic states and reasons, dedupe, recommendation lifecycle, limited signal, unknown-status deals skipped |
+| `responsibility-install` | Onboarding installs SYSTEM responsibilities, idempotent repair route, post-sync health failures logged and surfaced |
+| `deal-detail-recommendations` | Open vs resolved recommendations on the deal detail page |
 | Foundation suites | Tenancy, approval gate, API, integrations, units |
 
 ---
@@ -310,6 +326,134 @@ Google's limits (Usage limits page, updated 2026-09-10):
 
 ---
 
+## HubSpot, EmailActivity and Opportunity Health (Spec 03)
+
+### HubSpot (read-only)
+
+- **One org-wide integration**, connected and disconnected by an ADMIN/OWNER.
+  A partial unique index allows only one org-wide row per provider.
+- **Scopes requested** (read only): `oauth`, `crm.objects.deals.read`,
+  `crm.objects.contacts.read`, `crm.objects.companies.read`,
+  `crm.objects.owners.read`. A grant carrying any write scope is refused.
+- **HubSpot app setup:** create an **account-level** HubSpot OAuth app (not
+  user-level: `isUserLevel` must be false or unset) with exactly these scopes
+  and the redirect URL `…/api/integrations/hubspot/callback`. HubSpot
+  documents that user-level apps can't use several APIs the sync needs (owners,
+  association batch reads, v3 objects/search), so Tracklibute refuses tokens
+  whose introspection reports `isUserLevel: true`.
+- **OAuth endpoints (date-versioned 2026-03):** `POST /oauth/2026-03/token`
+  handles both the code exchange and refresh. `POST
+  /oauth/2026-03/token/introspect` checks that the token is active, is an access
+  token, was issued to our client ID, names a portal, and grants exactly the
+  read scopes. Every credential travels in a form body, never in a URL. The
+  deprecated v1 endpoints are no longer used or reachable.
+- **No write path exists.** Every HubSpot request passes a closed
+  (method, path) allow-list in `hubspot.client.ts`. The only POSTs are the
+  OAuth token exchange and introspection, plus read-only queries (search,
+  batch read). The `hubspot.*` actions stay in the registry without an executor.
+- **Sync:**
+  - Owners and deal pipeline stages are refreshed on every run. Stages come
+    from `GET /crm/pipelines/2026-09/deals`.
+  - **Pipelines unavailable:** if HubSpot refuses pipeline reads (403 without
+    `MISSING_SCOPES`, 404) or returns an unusable shape, the run continues.
+    The integration shows pipeline metadata as `UNAVAILABLE`, with a safe
+    reason. The last stage metadata HubSpot actually returned is kept, and
+    nothing is invented.
+  - **Open/closed classification:** a deal's open/closed status comes from its
+    stage's `isClosed`. If the stage doesn't state it, HubSpot's calculated
+    `hs_is_closed` is used. Otherwise the status is stored as **unknown**.
+    Unknown-status deals are never evaluated by Opportunity Health, and their
+    recommendations are left untouched.
+  - A **full reconcile** (deals list with embedded associations) runs on first
+    connect and every 24 h. It is resumable, and deals not seen in a
+    *complete* pass are archived.
+  - Between full passes, an **incremental** search on
+    `hs_lastmodifieddate ≥ watermark` runs, oldest first. Associations come from
+    v4 batch reads. At HubSpot's 10,000-result search window, the query
+    re-anchors at the newest timestamp seen.
+  - Only contacts and companies associated with a synced deal are fetched.
+- **Limits:**
+  - 90 requests per 10 s client-side, plus 4/s for search.
+  - Adaptive waits use `X-HubSpot-RateLimit-*` headers; 429s honour
+    `Retry-After`.
+  - A run stops as *partial* when less than 5% of the daily allowance remains.
+- **Lease, budget and checkpoints** follow the Gmail pattern. A revoked grant
+  (refresh `400/401`, or `403 MISSING_SCOPES`) sets `REAUTH_REQUIRED`.
+- **Disconnect** wipes the credentials and the CRM mirror and resolves its
+  recommendations. Nothing is sent to HubSpot; remove the app in HubSpot's
+  *Connected apps* to revoke it there.
+- **Owner mapping:** a HubSpot owner is auto-mapped to the member with the same
+  email (`AUTO_EMAIL`). An admin can override it (`MANUAL`), and sync never
+  overwrites a manual mapping. Mappings feed "mine" filters and the
+  limited-signal flag.
+
+### EmailActivity (content-free, organization-readable)
+
+- **What it is:** a derived layer written by each mailbox owner's Gmail sync,
+  in the same transaction as the message.
+- **Columns:** organization, mailbox user, integration, opaque Gmail
+  message/thread ids, direction, counterpart email/domain, and timestamp.
+  **No subject, snippet, body, labels or names.** This is enforced by the schema
+  and tested via `information_schema`.
+- **Eligible messages:** INBOUND or OUTBOUND, not bulk or automated (List-Id,
+  List-Unsubscribe, Precedence, Auto-Submitted), with at least one external
+  counterpart. Outbound uses To + Cc; Bcc is never used. Inbound uses the sender.
+- **Internal addresses are never counterparts:** the mailbox itself, members'
+  emails, the mailbox's own domain (unless it is a public provider), and the
+  admin-configured internal domains (`/settings/organization`).
+- **Access:** any member can SELECT. INSERT and DELETE are limited to the mailbox
+  owner by RLS. There is no UPDATE grant. Owner-private email tables are
+  unchanged.
+- **Rebuilds:** existing mailboxes are backfilled, and rule changes re-derived,
+  from locally stored mail on the next sync, with zero Gmail API calls.
+
+### Opportunity Health (deterministic)
+
+- **Data sources:** HubSpot plus EmailActivity only. No Calendar, no AI, no score.
+  Every open deal is **HEALTHY**, **NEEDS_ATTENTION** or **AT_RISK**.
+- **Reasons and thresholds:**
+
+  | Reason | Rule | State |
+  |---|---|---|
+  | `PAST_CLOSE_DATE` | close date before today | AT_RISK |
+  | `INACTIVE` | no email/CRM activity > `inactiveAfterDays` (7) | NEEDS_ATTENTION |
+  | `INACTIVE` (escalated) | > 2× threshold, or never any activity on an older deal | AT_RISK |
+  | `AWAITING_OUR_REPLY` | buyer wrote last, unanswered > `awaitingReplyAfterDays` (2) | NEEDS_ATTENTION |
+  | `AWAITING_OUR_REPLY` (escalated) | unanswered > `inactiveAfterDays` | AT_RISK |
+  | `NO_NEXT_ACTIVITY` | nothing scheduled in HubSpot | NEEDS_ATTENTION |
+  | `UNTRACKABLE` | no contact email / company domain to match | NEEDS_ATTENTION |
+
+- **Out of scope here:** missing CRM fields (e.g. close date) belong to the
+  future CRM Hygiene responsibility.
+- **Evidence** is metadata only (dates, counts, ids, reason codes). It is
+  validated against a strict allow-list before it is stored.
+- **Limited signal:** if the deal owner is unmapped or has no connected Gmail,
+  the deal is flagged *limited signal*, so a "gone quiet" result there may be a
+  false alarm.
+- **Recommendations:** one per deal, forever (`dedupe_key`). Each run creates,
+  refreshes in place, reopens or resolves it:
+  - Snoozed items reopen when the snooze expires.
+  - Dismissed or accepted items reopen only if the deal gets worse.
+  - Resolved items reopen as a new episode.
+  - Snooze, dismiss and accept go through the action registry as internal,
+    non-consequential actions.
+- **Installation:** onboarding installs every SYSTEM responsibility,
+  including Opportunity Health. Organizations created before that fix can be
+  repaired by an ADMIN with `POST /api/responsibilities/system` (optionally
+  `{"runOpportunityHealth": true}`), or with the *Install default
+  responsibilities* button on Settings → Integrations. The repair is
+  idempotent and doesn't touch existing responsibilities, connections or data.
+- **Post-sync failures are visible:** a health run that fails after a
+  completed HubSpot sync is logged (`opportunity_health.post_sync_failed`),
+  audited, and shown on the HubSpot card until a later run succeeds. It is
+  never silently swallowed.
+- **When it runs:** after each completed HubSpot sync, on
+  `POST /api/internal/cron/opportunity-health`, or manually by an ADMIN. Only
+  one run per organization can be active (DB partial unique index); stale runs
+  are failed after 15 minutes.
+
+---
+
 ## Security model
 
 - **Authentication boundary:** `AuthContext` comes from a server-side session plus
@@ -328,6 +472,9 @@ Google's limits (Usage limits page, updated 2026-09-10):
   Gmail transaction is bound to the user and org that started it.
 - **Organization isolation:** app-layer filters plus RLS on
   `organization_id`, plus composite `(organization_id, …)` foreign keys.
+- **CRM and EmailActivity:** organization-isolated by RLS on every new table.
+  EmailActivity is the only email-derived data other members can read, and it
+  has no content columns.
 - **Mailbox privacy:** raw synced mail is visible **only to the mailbox owner**:
   - App services always filter on `mailboxUserId = auth.userId`.
   - RLS on the email tables and on user-scoped integrations requires
@@ -371,13 +518,21 @@ PostgreSQL. Create a `tracklibute_app` role without `BYPASSRLS` before running
   - 90-day backfill and History API incremental sync, with expiry recovery, lease and cron
   - normalized EmailThread, EmailMessage and Recipient models and NormalizedEmailContext
   - owner-private RLS, a protected API and a minimal UI
+- **Spec 03:**
+  - read-only HubSpot OAuth and sync (deals, contacts, companies, owners, stages)
+  - owner → member mapping
+  - the content-free EmailActivity layer
+  - deterministic Opportunity Health
+  - recommendation deduplication and lifecycle
+  - opportunities, recommendations and settings UI
 
-### Explicitly out of scope (Spec 03+)
+### Explicitly out of scope (Spec 04+)
 
 - AI of any kind: reasoning, summaries, scoring
-- Opportunity Health, Lead Health and Follow-up detection
+- Lead Health, Follow-up, CRM Hygiene and Meeting Readiness detection
 - Daily brief
-- HubSpot, Calendar and CRM sync
+- Any CRM write (tasks, stage updates, notes, properties); HubSpot webhooks
+- Google Calendar
 - Email sending and autonomous actions
 - Custom responsibility execution
 - Gmail Pub/Sub push
@@ -416,3 +571,35 @@ PostgreSQL. Create a `tracklibute_app` role without `BYPASSRLS` before running
 - **An action stuck in `EXECUTING` after a crash has no recovery path yet.**
   This is inherited from Foundation.
 - **Organizations can't be hard-deleted** (the audit log is append-only).
+- **HubSpot association changes** that don't bump a deal's
+  `hs_lastmodifieddate` are picked up by the daily full reconcile, up to 24 h later.
+- **HubSpot list associations** are taken as embedded in the deals list. A deal
+  with more associations than HubSpot embeds per record may be incomplete
+  until an incremental update fetches them via v4.
+- **HubSpot verification so far — developer test portal only.** On a
+  HubSpot *developer test portal* (portal `247756835`, one deal), the
+  following was checked manually end to end:
+  - OAuth connection (2026-03 token + introspection) succeeded.
+  - The deal synced, and an associated contact appeared in Tracklibute.
+  - Opportunity Health flagged the deal while no next activity was scheduled.
+  - After a next activity was scheduled in HubSpot and synced, the deal became
+    Healthy and its recommendation moved from Open to Resolved.
+  - The deal detail page no longer shows the resolved recommendation as an
+    active issue.
+
+  This is **not** a production-customer validation. These were not exercised
+  against real HubSpot and are covered only by the in-process fake (`tests/support/fake-hubspot.ts`):
+  - volume (many deals, owners or pipelines)
+  - the 10,000-result search re-anchor, rate-limit and daily-allowance handling
+  - the pipelines-unavailable degraded state
+  - user-level app refusal, and reauth after uninstall or revocation
+  - long-running token refresh
+  - email-activity matching between a real Gmail mailbox and HubSpot contacts
+- **Other CRM reads still use v3/v4 paths** (`/crm/v3/objects/*`,
+  `/crm/v3/owners`, `/crm/v4/associations/*`). They are documented and
+  supported for account-level apps, but HubSpot now lists them under its
+  *legacy* API family.
+- **Clearing an owner mapping** lets sync re-create an AUTO mapping if the
+  emails still match.
+- **The opportunity detector counts only connected mailboxes.** That is why
+  limited signal is surfaced, not hidden.

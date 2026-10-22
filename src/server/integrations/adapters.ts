@@ -7,11 +7,12 @@ import {
 import { INTEGRATION_PROVIDER_INFO, type IntegrationProviderKey } from "@/domain/integrations/providers";
 
 import { GmailIntegrationAdapter } from "./gmail/gmail.adapter";
+import { HubSpotIntegrationAdapter } from "./hubspot/hubspot.adapter";
 
 /**
  * Placeholder adapter: declares the provider's capabilities so policy checks
- * work, but refuses every network operation. Replaced per provider in later
- * specs (HubSpotAdapter, GoogleCalendarAdapter).
+ * work, but refuses every network operation. Replaced per provider in its own
+ * spec (Google Calendar is deferred).
  */
 class PlaceholderAdapter implements IntegrationAdapter {
   readonly capabilities;
@@ -34,7 +35,7 @@ class PlaceholderAdapter implements IntegrationAdapter {
 
 const adapters: Record<IntegrationProviderKey, IntegrationAdapter> = {
   GMAIL: new GmailIntegrationAdapter(),
-  HUBSPOT: new PlaceholderAdapter("HUBSPOT"),
+  HUBSPOT: new HubSpotIntegrationAdapter(),
   GOOGLE_CALENDAR: new PlaceholderAdapter("GOOGLE_CALENDAR"),
 };
 

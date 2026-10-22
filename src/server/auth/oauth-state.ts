@@ -11,10 +11,11 @@ import { clearCookie, readCookie, serializeCookie } from "./cookies";
  * (state, nonce, PKCE verifier) between the redirect to Google and the
  * callback. CSRF protection: the callback's `state` must equal the cookie's,
  * and the cookie can only have been set by this server for this browser.
- * For Gmail connect it is additionally bound to the user + organization that
- * started the flow.
+ * For Gmail and HubSpot connect it is additionally bound to the user +
+ * organization that started the flow. (HubSpot is plain OAuth 2.0: nonce and
+ * codeVerifier are empty there.)
  */
-export type OAuthPurpose = "login" | "gmail";
+export type OAuthPurpose = "login" | "gmail" | "hubspot";
 
 export interface OAuthTransaction {
   purpose: OAuthPurpose;

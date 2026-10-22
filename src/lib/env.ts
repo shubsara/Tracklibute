@@ -32,9 +32,22 @@ const envSchema = z.object({
   // Wall-clock budget for one sync run; large backfills continue on the next run.
   GMAIL_SYNC_RUN_BUDGET_SECONDS: z.coerce.number().int().min(10).max(3600).default(210),
 
+  // HubSpot (read-only CRM connection; org-wide, connected by an ADMIN).
+  HUBSPOT_CLIENT_ID: optionalNonEmpty,
+  HUBSPOT_CLIENT_SECRET: optionalNonEmpty,
+  HUBSPOT_REDIRECT_URI: optionalNonEmpty.pipe(z.url().optional()),
+  // Client-side pacing: HubSpot allows 110 requests / 10 s per installed app; 90 leaves headroom.
+  HUBSPOT_REQUESTS_PER_10S: z.coerce.number().int().min(1).max(1000).default(90),
+  HUBSPOT_SYNC_RUN_BUDGET_SECONDS: z.coerce.number().int().min(10).max(3600).default(240),
+
+  // Bearer secret for the Spec 03 internal cron endpoints (HubSpot sync, Opportunity Health).
+  CRON_SECRET: optionalNonEmpty.pipe(z.string().min(32).optional()),
+
   // Test-only endpoint overrides (ignored unless NODE_ENV=test).
   GOOGLE_ISSUER: optionalNonEmpty,
   GMAIL_API_BASE_URL: optionalNonEmpty,
+  HUBSPOT_API_BASE_URL: optionalNonEmpty,
+  HUBSPOT_AUTH_BASE_URL: optionalNonEmpty,
 });
 
 export type Env = z.infer<typeof envSchema>;

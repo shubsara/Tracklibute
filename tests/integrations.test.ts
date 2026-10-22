@@ -29,16 +29,17 @@ afterAll(async () => {
 });
 
 describe("integration abstraction", () => {
-  it("has an adapter per MVP provider; Gmail is real and read-only, the rest are placeholders", async () => {
+  it("has an adapter per MVP provider; Gmail and HubSpot are real and read-only, Calendar is a placeholder", async () => {
     expect([...INTEGRATION_PROVIDERS]).toEqual(["GMAIL", "HUBSPOT", "GOOGLE_CALENDAR"]);
     const gmail = getIntegrationAdapter("GMAIL");
     expect(gmail.requiredScopes).toEqual(["https://www.googleapis.com/auth/gmail.readonly"]);
     expect(gmail.capabilities).toEqual(["email.read"]);
-    for (const provider of ["HUBSPOT", "GOOGLE_CALENDAR"] as const) {
-      const adapter = getIntegrationAdapter(provider);
-      expect(adapter.provider).toBe(provider);
-      await expect(adapter.checkConnection({})).rejects.toBeInstanceOf(IntegrationNotImplementedError);
-    }
+    const hubspot = getIntegrationAdapter("HUBSPOT");
+    expect(hubspot.capabilities).toEqual(["crm.read"]);
+    expect(hubspot.requiredScopes.every((s) => s === "oauth" || s.endsWith(".read"))).toBe(true);
+    const calendar = getIntegrationAdapter("GOOGLE_CALENDAR");
+    expect(calendar.provider).toBe("GOOGLE_CALENDAR");
+    await expect(calendar.checkConnection({})).rejects.toBeInstanceOf(IntegrationNotImplementedError);
   });
 });
 

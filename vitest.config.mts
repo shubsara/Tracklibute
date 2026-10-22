@@ -11,7 +11,7 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["tests/**/*.test.ts"],
+    include: ["tests/**/*.test.ts", "tests/**/*.test.tsx"],
     globalSetup: ["tests/support/global-setup.ts"],
     setupFiles: ["tests/support/load-env.ts"],
     // DB-backed tests share one Postgres; keep files serial for deterministic output.
