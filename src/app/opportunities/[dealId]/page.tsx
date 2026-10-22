@@ -6,6 +6,8 @@ import { NotFoundError } from "@/lib/errors";
 import { requirePageAuth } from "@/server/auth/page-session";
 import { type DealDetailDTO, getDeal } from "@/server/crm/crm.service";
 
+import { DealRecommendations } from "./deal-recommendations";
+
 export const dynamic = "force-dynamic";
 
 const fmt = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : "—");
@@ -34,13 +36,7 @@ export default async function DealPage({ params }: { params: Promise<{ dealId: s
         </div>
       </div>
 
-      {deal.recommendation && (
-        <div className="rounded border p-3 text-sm">
-          <p className="font-medium">{deal.recommendation.title}</p>
-          <p className="text-neutral-600">{deal.recommendation.summary}</p>
-          <p className="text-xs text-neutral-500">Recommendation status: {deal.recommendation.status.toLowerCase()}</p>
-        </div>
-      )}
+      <DealRecommendations active={deal.recommendation} resolved={deal.resolvedRecommendations} />
       {deal.health?.limitedSignal && <LimitedSignalNote />}
 
       <dl className="grid grid-cols-[11rem_1fr] gap-y-1 text-sm">

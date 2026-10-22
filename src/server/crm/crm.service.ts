@@ -8,6 +8,7 @@ import type { HealthState } from "@/domain/opportunity-health/detector";
 import type { OpportunityHealthEvidence } from "@/domain/opportunity-health/evidence";
 import { NotFoundError, ValidationError } from "@/lib/errors";
 import { withOrgScope } from "@/server/db/org-scope";
+import { partitionDealRecommendations } from "@/domain/recommendations/display";
 import { myDealIds } from "@/server/recommendations/recommendations.service";
 
 /**
@@ -27,6 +28,15 @@ export interface DealListItemDTO {
   health: { state: HealthState; reasons: OpportunityHealthEvidence["reasons"]; limitedSignal: boolean; evaluatedAt: string } | null;
 }
 
+export interface DealRecommendationDTO {
+  id: string;
+  status: string;
+  title: string;
+  summary: string;
+  severity: string;
+  resolvedAt: string | null;
+}
+
 export interface DealDetailDTO extends DealListItemDTO {
   pipeline: string | null;
   nextActivityAt: string | null;
@@ -34,7 +44,10 @@ export interface DealDetailDTO extends DealListItemDTO {
   contacts: { name: string | null; email: string | null }[];
   companies: { name: string | null; domain: string | null }[];
   evidence: OpportunityHealthEvidence | null;
-  recommendation: { id: string; status: string; title: string; summary: string; severity: string } | null;
+  /** The deal's current, unresolved recommendation (OPEN / SNOOZED / ACCEPTED / DISMISSED); never a RESOLVED one. */
+  recommendation: DealRecommendationDTO | null;
+  /** Resolved recommendations — history only, newest first. */
+  resolvedRecommendations: DealRecommendationDTO[];
   timeline: { occurredAt: string; direction: "INBOUND" | "OUTBOUND"; counterpartEmail: string; teammate: string | null }[];
 }
 
@@ -105,7 +118,7 @@ export async function getDeal(auth: AuthContext, id: string): Promise<DealDetail
         health: true,
         contacts: { include: { contact: true } },
         companies: { include: { company: true } },
-        recommendations: { orderBy: { createdAt: "desc" }, take: 1 },
+        recommendations: { orderBy: { createdAt: "desc" }, take: 20 },
       },
     });
     if (!d) throw new NotFoundError("Deal not found");
@@ -145,7 +158,15 @@ export async function getDeal(auth: AuthContext, id: string): Promise<DealDetail
       : [];
     const teammateBy = new Map(teammates.map((t) => [t.id, t.name ?? t.email]));
     const ev = (d.health?.reasons as OpportunityHealthEvidence | undefined) ?? null;
-    const rec = d.recommendations[0];
+    const recs = partitionDealRecommendations(d.recommendations);
+    const toDTO = (r: (typeof d.recommendations)[number]): DealRecommendationDTO => ({
+      id: r.id,
+      status: r.status,
+      title: r.title,
+      summary: r.summary,
+      severity: r.severity,
+      resolvedAt: r.resolvedAt?.toISOString() ?? null,
+    });
 
     return {
       id: d.id,
@@ -165,7 +186,8 @@ export async function getDeal(auth: AuthContext, id: string): Promise<DealDetail
       evidence: ev,
       contacts: d.contacts.map((c) => ({ name: personName(c.contact), email: c.contact.email })),
       companies: d.companies.map((c) => ({ name: c.company.name, domain: c.company.domain })),
-      recommendation: rec ? { id: rec.id, status: rec.status, title: rec.title, summary: rec.summary, severity: rec.severity } : null,
+      recommendation: recs.active ? toDTO(recs.active) : null,
+      resolvedRecommendations: recs.resolved.map(toDTO),
       timeline: activity
         .filter((a) => emails.includes(a.counterpartEmail) || domains.some((dom) => domainMatches(a.counterpartDomain, dom)))
         .map((a) => ({
