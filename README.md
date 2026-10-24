@@ -420,9 +420,19 @@ Google's limits (Usage limits page, updated 2026-09-10):
   | `INACTIVE` (escalated) | > 2× threshold, or never any activity on an older deal | AT_RISK |
   | `AWAITING_OUR_REPLY` | buyer wrote last, unanswered > `awaitingReplyAfterDays` (2) | NEEDS_ATTENTION |
   | `AWAITING_OUR_REPLY` (escalated) | unanswered > `inactiveAfterDays` | AT_RISK |
+  | `AWAITING_BUYER_REPLY` | salesperson wrote last, unanswered > `awaitingReplyAfterDays` (2) | NEEDS_ATTENTION |
+  | `AWAITING_BUYER_REPLY` (escalated) | unanswered > `inactiveAfterDays` (7) | AT_RISK |
   | `NO_NEXT_ACTIVITY` | nothing scheduled in HubSpot | NEEDS_ATTENTION |
   | `UNTRACKABLE` | no contact email / company domain to match | NEEDS_ATTENTION |
 
+- **Reply rules:** `AWAITING_OUR_REPLY` and `AWAITING_BUYER_REPLY` use the
+  latest matched inbound/outbound timestamps and the same 2-day / 7-day
+  thresholds. A scheduled CRM task does not suppress an unanswered-email reason.
+  Because `EmailActivity` is content-free, the MVP cannot infer whether a
+  specific outbound email explicitly requested a reply; any matched one-to-one
+  outbound email is treated as awaiting a response until a later inbound email
+  appears. Replies outside connected Gmail or unmatched contacts/domains may not
+  clear this signal.
 - **Out of scope here:** missing CRM fields (e.g. close date) belong to the
   future CRM Hygiene responsibility.
 - **Evidence** is metadata only (dates, counts, ids, reason codes). It is
