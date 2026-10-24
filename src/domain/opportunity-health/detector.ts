@@ -11,6 +11,8 @@
  *                       on a deal older than inactiveAfterDays          → AT_RISK
  *   AWAITING_OUR_REPLY  buyer wrote last, unanswered > awaitingReplyAfterDays → NEEDS_ATTENTION
  *                       unanswered > inactiveAfterDays                  → AT_RISK
+ *   AWAITING_BUYER_REPLY we wrote last, unanswered > awaitingReplyAfterDays → NEEDS_ATTENTION
+ *                       unanswered > inactiveAfterDays                  → AT_RISK
  *   NO_NEXT_ACTIVITY    no future activity scheduled in the CRM
  *                       (if flagMissingNextActivity)                    → NEEDS_ATTENTION
  *   UNTRACKABLE         no contact email and no company domain to match
@@ -28,6 +30,7 @@ export type HealthState = (typeof HEALTH_STATES)[number];
 export const REASON_CODES = [
   "PAST_CLOSE_DATE",
   "AWAITING_OUR_REPLY",
+  "AWAITING_BUYER_REPLY",
   "INACTIVE",
   "NO_NEXT_ACTIVITY",
   "UNTRACKABLE",
@@ -108,6 +111,22 @@ export function evaluateDeal(facts: DealFacts, config: OpportunityHealthConfig, 
     });
   }
 
+  // A scheduled next step does not mean the buyer has responded. This signal
+  // is based only on direction and timestamps; email content is never read.
+  if (
+    facts.lastOutboundAt &&
+    (!facts.lastInboundAt || facts.lastOutboundAt > facts.lastInboundAt) &&
+    now.getTime() - facts.lastOutboundAt.getTime() > config.awaitingReplyAfterDays * DAY_MS
+  ) {
+    const days = wholeDays(facts.lastOutboundAt, now);
+    reasons.push({
+      code: "AWAITING_BUYER_REPLY",
+      state: now.getTime() - facts.lastOutboundAt.getTime() > config.inactiveAfterDays * DAY_MS ? "AT_RISK" : "NEEDS_ATTENTION",
+      days,
+      at: facts.lastOutboundAt.toISOString(),
+    });
+  }
+
   if (lastActivityAt) {
     const idleMs = now.getTime() - lastActivityAt.getTime();
     if (idleMs > config.inactiveAfterDays * DAY_MS) {
@@ -167,6 +186,7 @@ export function isEscalation(prev: string | null, next: string): boolean {
 const REASON_TEXT: Record<ReasonCode, (r: HealthReason) => string> = {
   PAST_CLOSE_DATE: (r) => `The close date passed ${r.days ?? 1} day${r.days === 1 ? "" : "s"} ago.`,
   AWAITING_OUR_REPLY: (r) => `The buyer's last email has been unanswered for ${r.days ?? 0} days.`,
+  AWAITING_BUYER_REPLY: (r) => `Our last email has been unanswered for ${r.days ?? 0} days.`,
   INACTIVE: (r) => `No email or CRM activity for ${r.days ?? 0} days.`,
   NO_NEXT_ACTIVITY: () => "No next activity is scheduled in HubSpot.",
   UNTRACKABLE: () => "No contact email or company domain to track activity against.",
@@ -175,6 +195,7 @@ const REASON_TEXT: Record<ReasonCode, (r: HealthReason) => string> = {
 const TITLE: Record<ReasonCode, (deal: string) => string> = {
   PAST_CLOSE_DATE: (d) => `${d} is past its close date`,
   AWAITING_OUR_REPLY: (d) => `${d}: the buyer is waiting for a reply`,
+  AWAITING_BUYER_REPLY: (d) => `${d}: waiting for the buyer to reply`,
   INACTIVE: (d) => `${d} has gone quiet`,
   NO_NEXT_ACTIVITY: (d) => `${d} has no next step scheduled`,
   UNTRACKABLE: (d) => `${d} has no contacts to track`,
