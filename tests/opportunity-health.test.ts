@@ -271,7 +271,7 @@ describe("guards", () => {
 describe("read API", () => {
   it("lists deals with health, filters by state and 'mine'", async () => {
     const all = (await (await dealList(req("/api/crm/deals", org.members.VIEWER))).json()).data as Array<{ name: string; health: { state: string } | null }>;
-    expect(all.map((d) => d.name).sort()).toEqual(["awaiting", "healthy", "lonely", "quiet", "unmapped"]);
+    expect(all.map((d) => d.name).sort()).toEqual(["awaiting", "ghosted", "healthy", "lonely", "quiet", "unmapped"]);
     const mine = (await (await dealList(req("/api/crm/deals?mine=true", rep))).json()).data as Array<{ name: string }>;
     expect(mine.map((d) => d.name)).not.toContain("unmapped");
     const recs = (await (await recList(req("/api/recommendations?mine=true", rep))).json()).data as Array<{ dealId: string }>;
