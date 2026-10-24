@@ -217,7 +217,11 @@ describe("limits and safety", () => {
   it("only ADMIN can sync; one sync at a time", async () => {
     const { org, admin, integrationId } = await setup();
     expect((await syncRoute(req("/api/integrations/hubspot/sync", org.members.MEMBER, { method: "POST" }))).status).toBe(403);
-    await ownerDb().integration.update({ where: { id: integrationId }, data: { syncLeaseExpiresAt: new Date(Date.now() + 60_000) } });
+    // Use PostgreSQL's clock: claimLease() compares expiry against now().
+    await ownerDb().$executeRaw`
+      UPDATE integrations SET sync_lease_expires_at = now() + interval '1 hour'
+       WHERE id = ${integrationId}::uuid
+    `;
     await expect(syncHubSpot(admin, { trigger: "manual" })).rejects.toMatchObject({ code: "conflict" });
   });
 

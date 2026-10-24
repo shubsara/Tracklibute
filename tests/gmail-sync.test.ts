@@ -85,7 +85,9 @@ describe("initial sync", () => {
   it("processes thousands of messages in bounded batches", async () => {
     const { auth, integrationId, box } = await setup();
     for (let i = 0; i < 1050; i++) box.add(gmailMessage({ id: `bulk${i}`, threadId: `BT${i % 40}`, from: "n@x.io", date: daysAgo(1 + (i % 30)) }));
-    const r = await syncGmailMailbox(auth, { trigger: "manual" });
+    // This test measures batch processing, not Gmail quota pacing. Pacing is
+    // covered separately using a virtual clock, so keep the bulk test quick.
+    const r = await syncGmailMailbox(auth, { trigger: "manual", unitsPerSecond: 1_000_000 });
     expect(r.messagesUpserted).toBe(1050);
     expect(await counts(integrationId)).toEqual({ messages: 1050, threads: 40 });
     expect(google.requests.filter((q) => q.includes(`/messages?`) && q.includes("maxResults=100")).length).toBeGreaterThanOrEqual(11);
@@ -237,9 +239,16 @@ describe("concurrency", () => {
 
   it("a stale (expired) lease is recoverable", async () => {
     const { auth, integrationId } = await setup();
-    await ownerDb().integration.update({ where: { id: integrationId }, data: { syncLeaseExpiresAt: new Date(Date.now() + 60_000) } });
+    // Set the lease relative to PostgreSQL's clock, which is the clock used by claimLease().
+    await ownerDb().$executeRaw`
+      UPDATE integrations SET sync_lease_expires_at = now() + interval '1 hour'
+       WHERE id = ${integrationId}::uuid
+    `;
     await expect(syncGmailMailbox(auth, { trigger: "manual" })).rejects.toBeInstanceOf(ConflictError);
-    await ownerDb().integration.update({ where: { id: integrationId }, data: { syncLeaseExpiresAt: new Date(Date.now() - 1_000) } });
+    await ownerDb().$executeRaw`
+      UPDATE integrations SET sync_lease_expires_at = now() - interval '1 second'
+       WHERE id = ${integrationId}::uuid
+    `;
     await expect(syncGmailMailbox(auth, { trigger: "manual" })).resolves.toMatchObject({ syncType: "initial" });
   });
 });

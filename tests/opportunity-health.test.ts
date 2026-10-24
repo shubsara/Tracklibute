@@ -29,7 +29,7 @@ let admin: AuthContext; // runs health; NOT a mailbox owner
 let rep: AuthContext & { email: string }; // mailbox owner; mapped HubSpot owner
 let responsibilityId: string;
 let integrationId: string;
-const ext = {} as Record<"quiet" | "awaiting" | "healthy" | "overdue" | "won" | "unmapped" | "lonely", string>;
+const ext = {} as Record<"quiet" | "awaiting" | "healthy" | "overdue" | "won" | "unmapped" | "lonely" | "ghosted", string>;
 const SUBJECT = "Secret discount ladder";
 const BODY = "We can drop to 30% if pushed";
 
@@ -58,26 +58,27 @@ beforeAll(async () => {
     const contacts = email ? [hubspot.addContact(email).id] : [];
     ext[key] = hubspot.addDeal({ dealname: key, hubspot_owner_id: ownerId, notes_next_activity_date: future(5), createdate: isoDaysAgo(60), ...props }, { contacts }).id;
   };
-  mk("quiet", "quiet@buyer-a.io", {});
+  // CRM-only inactivity fixture isolates INACTIVE from email-direction reasons.
+  mk("quiet", "quiet@buyer-a.io", { notes_last_updated: isoDaysAgo(9) });
   mk("awaiting", "wait@buyer-b.io", {});
   mk("healthy", "happy@buyer-c.io", {});
   mk("overdue", "late@buyer-d.io", { closedate: isoDaysAgo(3) });
   mk("won", "won@buyer-e.io", { dealstage: "closedwon" });
   mk("unmapped", "x@buyer-f.io", { notes_last_updated: isoDaysAgo(1) }, strangerOwner.id);
   mk("lonely", null, { notes_last_updated: isoDaysAgo(1) });
+  mk("ghosted", "ghosted@buyer-g.io", {});
 
   const address = `rep-${org.slug}@seller.test`;
   await connectGmailFixture(google, rep, address);
   const box = google.mailbox(address);
   const mail = (id: string, from: string, to: string, days: number, sent = false) =>
     box.add(gmailMessage({ id, threadId: `T-${id}`, from, to, subject: SUBJECT, plain: BODY, date: daysAgo(days), ...(sent ? { labelIds: ["SENT"] } : {}) }));
-  mail("q-in", "quiet@buyer-a.io", address, 12);
-  mail("q-out", address, "quiet@buyer-a.io", 11, true);
   mail("w-out", address, "wait@buyer-b.io", 6, true);
   mail("w-in", "wait@buyer-b.io", address, 4);
   mail("h-in", "happy@buyer-c.io", address, 2);
   mail("h-out", address, "happy@buyer-c.io", 1, true);
   mail("o-out", address, "late@buyer-d.io", 1, true);
+  mail("g-out", address, "ghosted@buyer-g.io", 3, true);
 
   await syncHubSpot(admin, { trigger: "manual" });
   await syncGmailMailbox(rep, { trigger: "manual" });
@@ -95,7 +96,7 @@ describe("Opportunity Health run", () => {
     const before = hubspot.requests.length;
     const r = await runOpportunityHealth(admin, { trigger: "cron" });
     expect(hubspot.requests.length).toBe(before); // no HubSpot calls at all
-    expect(r).toMatchObject({ dealsEvaluated: 6, created: 4 });
+    expect(r).toMatchObject({ dealsEvaluated: 7, created: 5 });
     expect(await health()).toEqual({
       quiet: "NEEDS_ATTENTION",
       awaiting: "NEEDS_ATTENTION",
@@ -104,12 +105,14 @@ describe("Opportunity Health run", () => {
       won: null,
       unmapped: "HEALTHY",
       lonely: "NEEDS_ATTENTION",
+      ghosted: "NEEDS_ATTENTION",
     });
     const quiet = await recFor("quiet");
     expect(quiet).toMatchObject({ status: "OPEN", severity: "MEDIUM", title: "quiet has gone quiet" });
     expect((await recFor("awaiting"))!.title).toBe("awaiting: the buyer is waiting for a reply");
     expect((await recFor("overdue"))!.severity).toBe("HIGH");
     expect((await recFor("lonely"))!.title).toBe("lonely has no contacts to track");
+    expect((await recFor("ghosted"))!.title).toBe("ghosted: waiting for the buyer to reply");
     expect(await recFor("healthy")).toBeNull();
   });
 
@@ -119,7 +122,7 @@ describe("Opportunity Health run", () => {
     const dump = JSON.stringify({ recs, healthRows });
     expect(dump).not.toContain("Secret discount");
     expect(dump).not.toContain("drop to 30%");
-    const ev = (await recFor("quiet"))!.evidence as Record<string, unknown>;
+    const ev = (await recFor("ghosted"))!.evidence as Record<string, unknown>;
     expect(Object.keys(ev).sort()).toEqual([
       "crmLastActivityAt", "deal", "emailCoverage", "lastActivityAt", "lastEmailAt", "lastInboundAt", "lastOutboundAt",
       "lastTouchMailboxUserId", "matchedCounterpartCount", "reasons", "state",
@@ -138,7 +141,7 @@ describe("Opportunity Health run", () => {
   it("deduplicates: re-running updates in place, never duplicates", async () => {
     const count = await ownerDb().recommendation.count({ where: { responsibilityId } });
     const r = await runOpportunityHealth(admin, { trigger: "cron" });
-    expect(r).toMatchObject({ created: 0, reopened: 0, refreshed: 4 });
+    expect(r).toMatchObject({ created: 0, reopened: 0, refreshed: 5 });
     expect(await ownerDb().recommendation.count({ where: { responsibilityId } })).toBe(count);
   });
 });
@@ -182,7 +185,22 @@ describe("recommendation lifecycle", () => {
     expect((await act(rep, rec.id, "accept")).status).toBe(409);
   });
 
-  it("auto-resolves when the problem goes away (buyer answered)", async () => {
+  it("auto-resolves AWAITING_BUYER_REPLY when a buyer reply is synced", async () => {
+    const address = `rep-${org.slug}@seller.test`;
+    google.mailbox(address).add(gmailMessage({
+      id: "g-reply",
+      threadId: "T-g-out",
+      from: "ghosted@buyer-g.io",
+      to: address,
+      date: new Date(),
+    }));
+    await syncGmailMailbox(rep, { trigger: "manual" });
+    await runOpportunityHealth(admin, { trigger: "cron" });
+    expect((await recFor("ghosted"))!.status).toBe("RESOLVED");
+    expect((await health()).ghosted).toBe("HEALTHY");
+  });
+
+  it("auto-resolves AWAITING_OUR_REPLY when the buyer is answered", async () => {
     const address = `rep-${org.slug}@seller.test`;
     google.mailbox(address).add(gmailMessage({ id: "w-reply", threadId: "T-w", from: address, to: "wait@buyer-b.io", date: new Date(), labelIds: ["SENT"] }));
     await syncGmailMailbox(rep, { trigger: "manual" });
@@ -253,7 +271,7 @@ describe("guards", () => {
 describe("read API", () => {
   it("lists deals with health, filters by state and 'mine'", async () => {
     const all = (await (await dealList(req("/api/crm/deals", org.members.VIEWER))).json()).data as Array<{ name: string; health: { state: string } | null }>;
-    expect(all.map((d) => d.name).sort()).toEqual(["awaiting", "healthy", "lonely", "quiet", "unmapped"]);
+    expect(all.map((d) => d.name).sort()).toEqual(["awaiting", "ghosted", "healthy", "lonely", "quiet", "unmapped"]);
     const mine = (await (await dealList(req("/api/crm/deals?mine=true", rep))).json()).data as Array<{ name: string }>;
     expect(mine.map((d) => d.name)).not.toContain("unmapped");
     const recs = (await (await recList(req("/api/recommendations?mine=true", rep))).json()).data as Array<{ dealId: string }>;
@@ -261,7 +279,7 @@ describe("read API", () => {
   });
 
   it("deal detail shows a metadata-only timeline to any member", async () => {
-    const deal = await ownerDb().crmDeal.findFirstOrThrow({ where: { integrationId, name: "quiet" } });
+    const deal = await ownerDb().crmDeal.findFirstOrThrow({ where: { integrationId, name: "healthy" } });
     const res = await dealDetail(req(`/api/crm/deals/${deal.id}`, org.members.VIEWER), routeParams({ id: deal.id }));
     const body = (await res.json()).data;
     expect(body.timeline.map((t: { direction: string }) => t.direction)).toEqual(["OUTBOUND", "INBOUND"]);
