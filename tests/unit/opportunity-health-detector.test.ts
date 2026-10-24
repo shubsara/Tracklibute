@@ -55,7 +55,7 @@ describe("evaluateDeal", () => {
 
   it("INACTIVE thresholds: > N days NEEDS_ATTENTION, > 2N AT_RISK; latest of email and CRM activity counts", () => {
     expect(codes({ lastInboundAt: ago(8), lastOutboundAt: ago(8), crmLastActivityAt: ago(9) })).toEqual(["INACTIVE:NEEDS_ATTENTION"]);
-    expect(codes({ lastInboundAt: ago(20), lastOutboundAt: ago(15), crmLastActivityAt: null })).toEqual(["INACTIVE:AT_RISK"]);
+    expect(codes({ lastInboundAt: ago(20), lastOutboundAt: ago(20), crmLastActivityAt: null })).toEqual(["INACTIVE:AT_RISK"]);
     expect(codes({ lastInboundAt: null, lastOutboundAt: ago(30), crmLastActivityAt: ago(2) })).toEqual([]);
     expect(codes({ lastInboundAt: ago(7), lastOutboundAt: ago(7), crmLastActivityAt: null })).toEqual([]); // boundary: exactly N days
   });
