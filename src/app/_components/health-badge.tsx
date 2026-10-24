@@ -16,6 +16,7 @@ export function HealthBadge({ state }: { state: HealthState | null }) {
 export const REASON_LABEL: Record<string, string> = {
   PAST_CLOSE_DATE: "Past close date",
   AWAITING_OUR_REPLY: "Buyer awaiting reply",
+  AWAITING_BUYER_REPLY: "Waiting on buyer",
   INACTIVE: "Gone quiet",
   NO_NEXT_ACTIVITY: "No next step",
   UNTRACKABLE: "No contacts to track",
