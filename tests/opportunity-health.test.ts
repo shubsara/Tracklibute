@@ -279,7 +279,7 @@ describe("read API", () => {
   });
 
   it("deal detail shows a metadata-only timeline to any member", async () => {
-    const deal = await ownerDb().crmDeal.findFirstOrThrow({ where: { integrationId, name: "quiet" } });
+    const deal = await ownerDb().crmDeal.findFirstOrThrow({ where: { integrationId, name: "healthy" } });
     const res = await dealDetail(req(`/api/crm/deals/${deal.id}`, org.members.VIEWER), routeParams({ id: deal.id }));
     const body = (await res.json()).data;
     expect(body.timeline.map((t: { direction: string }) => t.direction)).toEqual(["OUTBOUND", "INBOUND"]);
