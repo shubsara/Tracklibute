@@ -72,6 +72,17 @@ describe("evaluateDeal", () => {
     expect(codes({ lastInboundAt: ago(9), lastOutboundAt: null, crmLastActivityAt: ago(1) })).toEqual(["AWAITING_OUR_REPLY:AT_RISK"]);
   });
 
+  it("AWAITING_BUYER_REPLY when we wrote last; a future task does not suppress it", () => {
+    expect(codes({ lastInboundAt: ago(5), lastOutboundAt: ago(3) })).toEqual(["AWAITING_BUYER_REPLY:NEEDS_ATTENTION"]);
+    expect(codes({ lastInboundAt: ago(5), lastOutboundAt: ago(2) })).toEqual([]); // exactly two days
+    expect(codes({ lastInboundAt: ago(1), lastOutboundAt: ago(3) })).toEqual([]); // reply arrived after outbound
+  });
+
+  it("AWAITING_BUYER_REPLY escalates only after inactiveAfterDays", () => {
+    expect(codes({ lastInboundAt: null, lastOutboundAt: ago(7), crmLastActivityAt: ago(1) })).toEqual(["AWAITING_BUYER_REPLY:NEEDS_ATTENTION"]);
+    expect(codes({ lastInboundAt: null, lastOutboundAt: new Date(NOW.getTime() - 7 * 86_400_000 - 1), crmLastActivityAt: ago(1) })).toEqual(["AWAITING_BUYER_REPLY:AT_RISK"]);
+  });
+
   it("NO_NEXT_ACTIVITY when nothing is scheduled or it is in the past (if enabled)", () => {
     expect(codes({ nextActivityAt: null })).toEqual(["NO_NEXT_ACTIVITY:NEEDS_ATTENTION"]);
     expect(codes({ nextActivityAt: ago(1) })).toEqual(["NO_NEXT_ACTIVITY:NEEDS_ATTENTION"]);
