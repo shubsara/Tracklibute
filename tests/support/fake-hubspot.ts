@@ -351,6 +351,16 @@ export class FakeHubSpot {
         })),
       }, headers);
     }
+    if (method === "GET" && path === "/crm/v3/objects/contacts") {
+      const limit = Number(url.searchParams.get("limit") ?? "10");
+      const after = Number(url.searchParams.get("after") ?? "0");
+      const all = [...this.contacts.values()];
+      const page = all.slice(after, after + limit);
+      return this.send(res, 200, {
+        results: page.map((c) => ({ ...c, archived: false })),
+        ...(after + limit < all.length ? { paging: { next: { after: String(after + limit) } } } : {}),
+      }, headers);
+    }
     if (method === "GET" && path === "/crm/v3/objects/deals") {
       const limit = Number(url.searchParams.get("limit") ?? "10");
       const after = Number(url.searchParams.get("after") ?? "0");

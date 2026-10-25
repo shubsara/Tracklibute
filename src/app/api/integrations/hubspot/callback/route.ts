@@ -9,6 +9,7 @@ import { getAuthContext } from "@/server/auth/resolve";
 import { redirect } from "@/server/http/route";
 import { completeHubSpotConnect } from "@/server/integrations/hubspot/hubspot-connection.service";
 import { syncHubSpot } from "@/server/integrations/hubspot/hubspot-sync.service";
+import { runLeadHealthAfterSync } from "@/server/lead-health/lead-health.service";
 import { runOpportunityHealthAfterSync } from "@/server/opportunity-health/opportunity-health.service";
 
 export const dynamic = "force-dynamic";
@@ -56,7 +57,10 @@ export async function GET(request: Request): Promise<Response> {
     if (result.isFirstConnection) {
       runAfterResponse(async () => {
         const r = await syncHubSpot(auth, { trigger: "connect" });
-        if (r.outcome === "completed") await runOpportunityHealthAfterSync(auth, "connect");
+        if (r.outcome === "completed") {
+          await runOpportunityHealthAfterSync(auth, "connect");
+          await runLeadHealthAfterSync(auth, "hubspot_connect");
+        }
       });
     }
     return redirect(`${SETTINGS}?hubspot=connected`, 303, [clearTx]);

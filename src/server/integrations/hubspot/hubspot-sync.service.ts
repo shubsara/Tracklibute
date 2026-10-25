@@ -35,7 +35,7 @@ import { markHubSpotReauthRequired } from "./hubspot-reauth";
  *                          oldest first; associations via v4 batch read;
  *                          re-anchors the watermark at HubSpot's 10k result cap
  *
- *   Only contacts / companies associated with a synced deal are fetched.
+ *   All contacts (including standalone leads) are reconciled after deals.
  *   Runs are time-boxed (HUBSPOT_SYNC_RUN_BUDGET_SECONDS); a run that stops on
  *   budget or the daily-allowance reserve ends PARTIAL and resumes next run.
  *   All writes are idempotent upserts under the caller's AuthContext + RLS.
@@ -58,6 +58,7 @@ export interface HubSpotSyncResult {
   dealsUpserted: number;
   dealsArchived: number;
   contactsUpserted: number;
+  contactsArchived: number;
   companiesUpserted: number;
   ownersUpserted: number;
   stagesUpserted: number;
@@ -94,6 +95,7 @@ interface WatermarkCursor {
 }
 interface FullPassCursor {
   v: 1;
+  phase?: "deals" | "contacts";
   after: string | null;
   passStartedAt: string;
 }
@@ -109,7 +111,11 @@ function parseJson<T>(raw: string | null, check: (v: Record<string, unknown>) =>
 }
 const parseWatermark = (raw: string | null) => parseJson<WatermarkCursor>(raw, (v) => typeof v.watermark === "number");
 const parseFullPass = (raw: string | null) =>
-  parseJson<FullPassCursor>(raw, (v) => typeof v.passStartedAt === "string" && (v.after === null || typeof v.after === "string"));
+  parseJson<FullPassCursor>(raw, (v) =>
+    typeof v.passStartedAt === "string" &&
+    (v.after === null || typeof v.after === "string") &&
+    (v.phase === undefined || v.phase === "deals" || v.phase === "contacts"),
+  );
 
 interface SyncCtx {
   auth: AuthContext;
@@ -120,6 +126,7 @@ interface SyncCtx {
   stages: Map<string, Pick<CrmStageRecord, "isClosed" | "isWon">>;
   pipelineMetadata: "OK" | "UNAVAILABLE";
   counters: Omit<HubSpotSyncResult, "integrationId" | "mode" | "outcome" | "trigger" | "resumed" | "durationMs" | "pipelineMetadata">;
+  seenContactExternalIds: Set<string>;
 }
 
 const budgetExhausted = (ctx: SyncCtx) => ctx.clock.now() >= ctx.deadlineAt;
@@ -260,10 +267,31 @@ async function syncOwnersAndStages(ctx: SyncCtx, source: CrmSource): Promise<voi
 
 // ─── Deals (+ associated contacts / companies) ──────────────────────────────
 
-async function upsertContacts(tx: Tx, scope: { organizationId: string; integrationId: string }, rows: readonly CrmContactRecord[]) {
+async function upsertContacts(
+  tx: Tx,
+  scope: { organizationId: string; integrationId: string },
+  rows: readonly CrmContactRecord[],
+  seenAt: Date | null,
+) {
   const ids = new Map<string, string>();
   for (const c of rows) {
-    const data = { email: c.email, firstName: c.firstName, lastName: c.lastName, externalUpdatedAt: c.externalUpdatedAt, archivedAt: null };
+    const data = {
+      email: c.email,
+      firstName: c.firstName,
+      lastName: c.lastName,
+      lifecycleStage: c.lifecycleStage,
+      leadStatus: c.leadStatus,
+      ownerExternalId: c.ownerExternalId,
+      externalCreatedAt: c.externalCreatedAt,
+      externalUpdatedAt: c.externalUpdatedAt,
+      dateEnteredSalesQualifiedLead: c.dateEnteredSalesQualifiedLead,
+      dateEnteredMarketingQualifiedLead: c.dateEnteredMarketingQualifiedLead,
+      crmLastActivityAt: c.crmLastActivityAt,
+      crmLastContactedAt: c.crmLastContactedAt,
+      nextActivityAt: c.nextActivityAt,
+      archivedAt: null,
+      ...(seenAt ? { lastSeenFullSyncAt: seenAt } : {}),
+    };
     const r = await tx.crmContact.upsert({
       where: { organizationId_integrationId_externalId: { ...scope, externalId: c.externalId } },
       create: { ...scope, externalId: c.externalId, ...data },
@@ -306,7 +334,7 @@ async function persistDeals(ctx: SyncCtx, source: CrmSource, deals: readonly Crm
   const { auth, integrationId } = ctx;
   const scope = { organizationId: auth.organizationId, integrationId };
   await withOrgScope(auth, async (tx) => {
-    const contactIds = await upsertContacts(tx, scope, contacts);
+    const contactIds = await upsertContacts(tx, scope, contacts, seenAt);
     const companyIds = await upsertCompanies(tx, scope, companies);
     for (const d of deals) {
       const stage = d.pipelineExternalId && d.stageExternalId ? ctx.stages.get(`${d.pipelineExternalId}/${d.stageExternalId}`) : undefined;
@@ -359,7 +387,12 @@ async function persistDeals(ctx: SyncCtx, source: CrmSource, deals: readonly Crm
     }
   });
   ctx.counters.dealsUpserted += deals.length;
-  ctx.counters.contactsUpserted += contacts.length;
+  for (const c of contacts) {
+    if (!ctx.seenContactExternalIds.has(c.externalId)) {
+      ctx.seenContactExternalIds.add(c.externalId);
+      ctx.counters.contactsUpserted++;
+    }
+  }
   ctx.counters.companiesUpserted += companies.length;
 }
 
@@ -367,21 +400,55 @@ type StepResult = { complete: boolean };
 
 async function fullPass(ctx: SyncCtx, source: CrmSource, existing: FullPassCursor | null): Promise<StepResult> {
   const passStartedAt = existing ? new Date(existing.passStartedAt) : new Date(ctx.clock.now());
+  let phase: "deals" | "contacts" = existing?.phase ?? "deals";
   let after = existing?.after ?? undefined;
-  if (!existing) await checkpoint(ctx, { backfillCursor: JSON.stringify({ v: 1, after: null, passStartedAt: passStartedAt.toISOString() }) });
-  for (;;) {
-    if (budgetExhausted(ctx)) return { complete: false };
-    const page = await source.listDeals(after);
-    await persistDeals(ctx, source, page.items, passStartedAt);
-    after = page.next ?? undefined;
-    if (!after) break;
-    await checkpoint(ctx, { backfillCursor: JSON.stringify({ v: 1, after, passStartedAt: passStartedAt.toISOString() }) });
+  if (!existing) {
+    await checkpoint(ctx, { backfillCursor: JSON.stringify({ v: 1, phase: "deals", after: null, passStartedAt: passStartedAt.toISOString() }) });
   }
 
-  // Pass completed: anything not seen since it started no longer exists (or is archived) in HubSpot.
+  if (phase === "deals") {
+    for (;;) {
+      if (budgetExhausted(ctx)) return { complete: false };
+      const page = await source.listDeals(after);
+      await persistDeals(ctx, source, page.items, passStartedAt);
+      after = page.next ?? undefined;
+      if (!after) break;
+      await checkpoint(ctx, { backfillCursor: JSON.stringify({ v: 1, phase: "deals", after, passStartedAt: passStartedAt.toISOString() }) });
+    }
+    // Reconcile every CRM contact as well, including contacts not tied to a deal.
+    phase = "contacts";
+    after = undefined;
+    await checkpoint(ctx, { backfillCursor: JSON.stringify({ v: 1, phase, after: null, passStartedAt: passStartedAt.toISOString() }) });
+  }
+
+  if (phase === "contacts") {
+    for (;;) {
+      if (budgetExhausted(ctx)) return { complete: false };
+      const page = await source.listContacts(after);
+      await withOrgScope(ctx.auth, async (tx) => {
+        await upsertContacts(tx, { organizationId: ctx.auth.organizationId, integrationId: ctx.integrationId }, page.items, passStartedAt);
+      });
+      for (const c of page.items) {
+        if (!ctx.seenContactExternalIds.has(c.externalId)) {
+          ctx.seenContactExternalIds.add(c.externalId);
+          ctx.counters.contactsUpserted++;
+        }
+      }
+      after = page.next ?? undefined;
+      if (!after) break;
+      await checkpoint(ctx, { backfillCursor: JSON.stringify({ v: 1, phase: "contacts", after, passStartedAt: passStartedAt.toISOString() }) });
+    }
+  }
+
+  // Archive only after complete passes over both deals and contacts.
   const { auth, integrationId } = ctx;
   ctx.counters.dealsArchived += await withOrgScope(auth, (tx) => tx.$executeRaw`
     UPDATE crm_deals SET archived_at = now(), updated_at = now()
+     WHERE organization_id = ${auth.organizationId}::uuid AND integration_id = ${integrationId}::uuid
+       AND archived_at IS NULL
+       AND (last_seen_full_sync_at IS NULL OR last_seen_full_sync_at < ${passStartedAt})`);
+  ctx.counters.contactsArchived += await withOrgScope(auth, (tx) => tx.$executeRaw`
+    UPDATE crm_contacts SET archived_at = now(), updated_at = now()
      WHERE organization_id = ${auth.organizationId}::uuid AND integration_id = ${integrationId}::uuid
        AND archived_at IS NULL
        AND (last_seen_full_sync_at IS NULL OR last_seen_full_sync_at < ${passStartedAt})`);
@@ -477,10 +544,12 @@ export async function syncHubSpot(auth: AuthContext, opts: HubSpotSyncOptions): 
     deadlineAt: opts.deadlineAt ?? started + env.HUBSPOT_SYNC_RUN_BUDGET_SECONDS * 1000,
     stages: new Map(),
     pipelineMetadata: "OK",
+    seenContactExternalIds: new Set<string>(),
     counters: {
       dealsUpserted: 0,
       dealsArchived: 0,
       contactsUpserted: 0,
+      contactsArchived: 0,
       companiesUpserted: 0,
       ownersUpserted: 0,
       stagesUpserted: 0,

@@ -8,10 +8,10 @@ Opportunity Health, Follow-up, CRM Hygiene and Meeting Readiness. It watches
 Gmail, HubSpot and Google Calendar, raises **Recommendations**, and proposes
 **Actions** that a human approves before anything consequential happens.
 
-> **Current stage: Build Spec 03.** This stage adds a read-only HubSpot mirror,
-> a content-free, organization-readable EmailActivity layer, and the first
-> deterministic responsibility: **Opportunity Health**. There is no AI, no
-> scoring, no CRM writes, no Calendar and no email sending.
+> **Current stage: Spec 05 — Lead Health.** Tracklibute has a read-only HubSpot
+> mirror, content-free organization-readable EmailActivity, and deterministic
+> Opportunity Health. Spec 05 adds qualification-aware Lead Health for standalone
+> contacts. There is no AI scoring, no CRM writes, and no email sending.
 
 ---
 
@@ -371,7 +371,12 @@ Google's limits (Usage limits page, updated 2026-09-10):
     `hs_lastmodifieddate ≥ watermark` runs, oldest first. Associations come from
     v4 batch reads. At HubSpot's 10,000-result search window, the query
     re-anchors at the newest timestamp seen.
-  - Only contacts and companies associated with a synced deal are fetched.
+  - Deal-associated contacts and companies are fetched for relationship mapping.
+  - Lead Health's full reconcile also lists every contact, including standalone
+    contacts not yet associated with a deal, so qualification and activity can
+    be evaluated before an opportunity exists. Contact changes are refreshed on
+    the next complete contact reconcile (at most every 24 h), while email activity
+    is re-evaluated after Gmail sync.
 - **Limits:**
   - 90 requests per 10 s client-side, plus 4/s for search.
   - Adaptive waits use `X-HubSpot-RateLimit-*` headers; 429s honour
@@ -512,6 +517,35 @@ PostgreSQL. Create a `tracklibute_app` role without `BYPASSRLS` before running
 
 ---
 
+### Lead Health (Spec 05 — in progress)
+
+- **Purpose:** identify qualified standalone contacts that haven't received a
+  timely first touch, are inactive, or are waiting on a response.
+- **Contact mirror:** full reconciliation fetches all non-archived HubSpot
+  contacts, including those not associated with a deal. Qualification, lifecycle,
+  owner, contact/activity timestamps and qualification-stage timestamps are
+  mirrored; stale records are archived only after the complete contact pass.
+- **Qualification:** Sales Qualified Lead is included by default. Marketing
+  Qualified Lead is optional. Customers and contacts explicitly marked
+  Unqualified or Bad Timing are excluded. Any associated active or unknown-status
+  deal suppresses pre-opportunity Lead Health to avoid duplicate alerts.
+- **Rules:** no first touch after more than 1 business day → NEEDS_ATTENTION;
+  no first touch after more than 3 business days → AT_RISK. General inactivity
+  after more than 3 business days → NEEDS_ATTENTION and more than 5 → AT_RISK.
+  Reply-direction alerts use more than 2 business days and escalate after more
+  than 7 calendar days. A future planned activity suppresses general inactivity,
+  but not an overdue direction-specific reply alert.
+- **Evidence:** exact contact email matches drive reply direction. Activity from
+  the same business email domain is context only; it doesn't reset the contact's
+  individual inactivity clock. No email content is copied into shared evidence.
+  Missing qualification timestamps never trigger guessed first-touch deadlines.
+- **Lifecycle:** one deduplicated recommendation per contact; recommendation
+  resolves when the lead is healthy or no longer eligible. Leads without an
+  email address aren't classified as cold. A missing connected Gmail mailbox is
+  recorded as limited signal, not hidden.
+- **Boundaries:** HubSpot remains read-only. No CRM writes, AI scoring, or email
+  sending. Defaults need validation with the developer test portal before merge.
+
 ## Scope
 
 ### Done
@@ -536,10 +570,10 @@ PostgreSQL. Create a `tracklibute_app` role without `BYPASSRLS` before running
   - recommendation deduplication and lifecycle
   - opportunities, recommendations and settings UI
 
-### Explicitly out of scope (Spec 04+)
+### Still out of scope for the current MVP
 
 - AI of any kind: reasoning, summaries, scoring
-- Lead Health, Follow-up, CRM Hygiene and Meeting Readiness detection
+- Follow-up, CRM Hygiene and Meeting Readiness detection
 - Daily brief
 - Any CRM write (tasks, stage updates, notes, properties); HubSpot webhooks
 - Google Calendar
