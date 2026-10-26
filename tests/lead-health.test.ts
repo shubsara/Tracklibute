@@ -28,6 +28,9 @@ let lostContactId: string;
 let mqlContactId: string;
 let activeDealContactId: string;
 let wonDealContactId: string;
+let unqualifiedContactId: string;
+let badTimingContactId: string;
+let customerContactId: string;
 
 beforeAll(async () => {
   google = await startFakeGoogleEnv();
@@ -81,11 +84,34 @@ beforeAll(async () => {
     hs_v2_date_entered_salesqualifiedlead: qualifiedAt,
     createdate: qualifiedAt,
   });
+  const unqualified = hubspot.addContact("unqualified@buyer.io", {
+    lifecyclestage: "salesqualifiedlead",
+    hubspot_owner_id: repOwner.id,
+    hs_lead_status: "UNQUALIFIED",
+    hs_v2_date_entered_salesqualifiedlead: qualifiedAt,
+    createdate: qualifiedAt,
+  });
+  const badTiming = hubspot.addContact("bad-timing@buyer.io", {
+    lifecyclestage: "salesqualifiedlead",
+    hubspot_owner_id: repOwner.id,
+    hs_lead_status: "BAD_TIMING",
+    hs_v2_date_entered_salesqualifiedlead: qualifiedAt,
+    createdate: qualifiedAt,
+  });
+  const customer = hubspot.addContact("customer@buyer.io", {
+    lifecyclestage: "customer",
+    hubspot_owner_id: repOwner.id,
+    hs_lead_status: "IN_PROGRESS",
+    createdate: qualifiedAt,
+  });
   sqlContactId = sql.id;
   lostContactId = lost.id;
   mqlContactId = mql.id;
   activeDealContactId = active.id;
   wonDealContactId = won.id;
+  unqualifiedContactId = unqualified.id;
+  badTimingContactId = badTiming.id;
+  customerContactId = customer.id;
 
   hubspot.addDeal({ dealname: "Prior closed-lost deal", dealstage: "closedlost" }, { contacts: [lost.id] });
   hubspot.addDeal({ dealname: "Active opportunity", dealstage: "qualified" }, { contacts: [active.id] });
@@ -126,13 +152,16 @@ describe("Lead Health", () => {
     expect(await leadRecommendation(mqlContactId)).toBeNull();
     expect(await leadRecommendation(activeDealContactId)).toBeNull();
     expect(await leadRecommendation(wonDealContactId)).toBeNull();
+    expect(await leadRecommendation(unqualifiedContactId)).toBeNull();
+    expect(await leadRecommendation(badTimingContactId)).toBeNull();
+    expect(await leadRecommendation(customerContactId)).toBeNull();
     expect(hubspot.writeRequests()).toEqual([]);
 
     const rows = await ownerDb().crmContact.findMany({
       where: { organizationId: org.organizationId, integrationId, archivedAt: null },
       select: { email: true, lifecycleStage: true, leadStatus: true, dateEnteredSalesQualifiedLead: true },
     });
-    expect(rows).toHaveLength(5);
+    expect(rows).toHaveLength(8);
     expect(rows.find((row) => row.email === "sql@buyer.io")).toMatchObject({ lifecycleStage: "salesqualifiedlead", leadStatus: "in_progress" });
   });
 
@@ -155,5 +184,17 @@ describe("Lead Health", () => {
     const dump = JSON.stringify(rec.evidence);
     expect(dump).not.toContain("sql@buyer.io");
     expect(dump).not.toContain("Following up on our conversation");
+
+  it("marks signal as limited when a qualified contact's owner is unmapped", async () => {
+    const contact = await localContact(lostContactId);
+    await ownerDb().crmContact.update({ where: { id: contact.id }, data: { ownerExternalId: null } });
+    const r = await runLeadHealth(admin, { trigger: "manual" });
+    expect(r.limitedSignal).toBe(1);
+    expect(await leadRecommendation(lostContactId)).toMatchObject({
+      status: "OPEN",
+      evidence: { ownerMapped: false, ownerMailboxConnected: false, limitedSignal: true },
+    });
+    expect((await leadRecommendation(lostContactId))!.summary).toContain("owner is unmapped or has no connected mailbox");
+  });
   });
 });
