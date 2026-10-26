@@ -540,7 +540,7 @@ PostgreSQL. Create a `tracklibute_app` role without `BYPASSRLS` before running
 - **Evidence:** exact contact email matches drive reply direction. Activity from
   the same business email domain is context only; it doesn't reset the contact's
   individual inactivity clock. No email content is copied into shared evidence.
-  Missing qualification timestamps never trigger guessed first-touch deadlines.
+  Missing qualification timestamps never trigger guessed first-touch deadlines. Business-day counting currently uses the UTC weekday calendar because organization time zones are not configurable yet.
 - **Lifecycle:** one deduplicated recommendation per contact; recommendation
   resolves when the lead is healthy or no longer eligible. Leads without an
   email address aren't classified as cold. An unmapped contact owner or one without a connected Gmail mailbox is
