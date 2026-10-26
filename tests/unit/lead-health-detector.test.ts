@@ -32,14 +32,14 @@ const codes = (facts: Partial<LeadFacts>, now = NOW) =>
 
 describe("business-day counting", () => {
   it("does not count Saturdays or Sundays", () => {
-    expect(businessDaysBetween(new Date("2026-10-23T12:00:00Z"), new Date("2026-10-28T12:00:00Z"))).toBe(1);
+    expect(businessDaysBetween(new Date("2026-10-23T12:00:00Z"), new Date("2026-10-28T12:00:00Z"))).toBe(3);
   });
 });
 
 describe("evaluateLead", () => {
   it("flags a qualified lead with no first touch after one business day and escalates after three", () => {
     expect(codes({ qualificationAt: new Date("2026-10-29T12:00:00Z"), lastInboundAt: null, lastOutboundAt: null, crmLastContactedAt: null, crmLastActivityAt: null, nextActivityAt: null })).toEqual([]);
-    expect(codes({ qualificationAt: new Date("2026-10-26T12:00:00Z"), lastInboundAt: null, lastOutboundAt: null, crmLastContactedAt: null, crmLastActivityAt: null, nextActivityAt: null })).toEqual(["NO_FIRST_TOUCH:NEEDS_ATTENTION"]);
+    expect(codes({ qualificationAt: new Date("2026-10-28T12:00:00Z"), lastInboundAt: null, lastOutboundAt: null, crmLastContactedAt: null, crmLastActivityAt: null, nextActivityAt: null })).toEqual(["NO_FIRST_TOUCH:NEEDS_ATTENTION"]);
     expect(codes({ qualificationAt: new Date("2026-10-20T12:00:00Z"), lastInboundAt: null, lastOutboundAt: null, crmLastContactedAt: null, crmLastActivityAt: null, nextActivityAt: null })).toEqual(["NO_FIRST_TOUCH:AT_RISK"]);
   });
 
