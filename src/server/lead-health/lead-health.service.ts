@@ -137,23 +137,33 @@ export async function runLeadHealth(auth: AuthContext, opts: LeadHealthRunOption
       const contacts = await tx.crmContact.findMany({
         where: { organizationId: auth.organizationId, integrationId, archivedAt: null },
         select: {
-          id: true, externalId: true, email: true, firstName: true, lastName: true, lifecycleStage: true,
+          id: true, externalId: true, email: true, firstName: true, lastName: true, lifecycleStage: true, ownerExternalId: true,
           leadStatus: true, dateEnteredSalesQualifiedLead: true, dateEnteredMarketingQualifiedLead: true,
           crmLastActivityAt: true, crmLastContactedAt: true, nextActivityAt: true,
           deals: { select: { deal: { select: { isClosed: true, isWon: true, archivedAt: true } } } },
         },
       });
-      const connected = await tx.integration.findMany({
-        where: { organizationId: auth.organizationId, provider: "GMAIL", ownerUserId: { not: null }, status: "CONNECTED" },
-        select: { id: true },
-      });
+      const [connected, owners] = await Promise.all([
+        tx.integration.findMany({
+          where: { organizationId: auth.organizationId, provider: "GMAIL", ownerUserId: { not: null }, status: "CONNECTED" },
+          select: { ownerUserId: true },
+        }),
+        tx.crmOwner.findMany({
+          where: { organizationId: auth.organizationId, integrationId, mapping: { isNot: null } },
+          select: { externalId: true, mapping: { select: { userId: true } } },
+        }),
+      ]);
       const activity = await aggregateContactActivity(tx, auth.organizationId, contacts.map((c) => ({ id: c.id, email: c.email })));
       const recs = await tx.recommendation.findMany({
         where: { organizationId: auth.organizationId, responsibilityId: responsibility.id, dedupeKey: { startsWith: KEY_PREFIX } },
         select: { id: true, dedupeKey: true, status: true, fingerprint: true, snoozedUntil: true },
       });
       return {
-        contacts, connectedMailboxCount: connected.length, activity, recs,
+        contacts,
+        connectedMailboxCount: connected.length,
+        connectedUsers: new Set(connected.flatMap((i) => i.ownerUserId ? [i.ownerUserId] : [])),
+        ownerUser: new Map(owners.map((o) => [o.externalId, o.mapping!.userId])),
+        activity, recs,
         recByKey: new Map(recs.flatMap((r) => r.dedupeKey ? [[r.dedupeKey, r] as const] : [])),
       };
     });
@@ -183,7 +193,10 @@ export async function runLeadHealth(auth: AuthContext, opts: LeadHealthRunOption
           if (evaluation.state === "HEALTHY") result.healthy++;
           else if (evaluation.state === "NEEDS_ATTENTION") result.needsAttention++;
           else result.atRisk++;
-          const limitedSignal = data.connectedMailboxCount === 0;
+          const ownerUserId = contact.ownerExternalId ? (data.ownerUser.get(contact.ownerExternalId) ?? null) : null;
+          const ownerMapped = ownerUserId !== null;
+          const ownerMailboxConnected = ownerUserId !== null && data.connectedUsers.has(ownerUserId);
+          const limitedSignal = !ownerMailboxConnected;
           if (limitedSignal) result.limitedSignal++;
 
           const lastAnyActivity = latest(agg.lastInboundAt, agg.lastOutboundAt, contact.crmLastActivityAt, contact.crmLastContactedAt);
@@ -196,7 +209,7 @@ export async function runLeadHealth(auth: AuthContext, opts: LeadHealthRunOption
             lastActivityAt: iso(evaluation.lastActivityAt), crmLastActivityAt: iso(contact.crmLastActivityAt),
             crmLastContactedAt: iso(contact.crmLastContactedAt), nextActivityAt: iso(contact.nextActivityAt),
             lastAccountActivityAt: iso(agg.lastAccountActivityAt), accountMoreRecentlyActive,
-            lifecycleStage, leadStatus, connectedMailboxes: data.connectedMailboxCount, limitedSignal,
+            lifecycleStage, leadStatus, connectedMailboxes: data.connectedMailboxCount, ownerMapped, ownerMailboxConnected, limitedSignal,
             priorClosedLost: qualification.priorClosedLost, contact: { id: contact.id, externalId: contact.externalId },
           } satisfies LeadHealthEvidence);
 
@@ -263,7 +276,7 @@ async function applyLeadRecommendation(
   const context: string[] = [];
   if (input.priorClosedLost) context.push("A prior closed-lost deal exists; consider whether this is a reactivation opportunity.");
   if (input.accountMoreRecentlyActive) context.push("Other activity at this business email domain is more recent; it does not prove this contact was reached.");
-  if (input.evidence.limitedSignal) context.push("Gmail coverage is limited because no team mailbox is connected.");
+  if (input.evidence.limitedSignal) context.push("Gmail coverage may be limited because this contact owner is unmapped or has no connected mailbox.");
   const fields = {
     title: described.title, summary: [described.summary, ...context].join(" "),
     severity: SEVERITY[evaluation.state as "NEEDS_ATTENTION" | "AT_RISK"],
