@@ -162,7 +162,7 @@ export async function runLeadHealth(auth: AuthContext, opts: LeadHealthRunOption
         contacts,
         connectedMailboxCount: connected.length,
         connectedUsers: new Set(connected.flatMap((i) => i.ownerUserId ? [i.ownerUserId] : [])),
-        ownerUser: new Map(owners.map((o) => [o.externalId, o.mapping!.userId])),
+        ownerUser: new Map(owners.map((o) => [o.externalId, o.mapping!.userId] as const)),
         activity, recs,
         recByKey: new Map(recs.flatMap((r) => r.dedupeKey ? [[r.dedupeKey, r] as const] : [])),
       };
