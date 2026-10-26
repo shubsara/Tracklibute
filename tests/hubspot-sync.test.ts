@@ -77,7 +77,7 @@ describe("full reconcile", () => {
     const row = await integration(integrationId);
     expect(row.fullSyncedAt).not.toBeNull();
     expect(row.backfillCursor).toBeNull();
-    expect(JSON.parse(row.syncCursor!)).toMatchObject({ v: 1, watermark: expect.any(Number) });
+    expect(JSON.parse(row.syncCursor!)).toMatchObject({ v: 2, watermark: expect.any(Number) });
     expect(row.syncLeaseExpiresAt).toBeNull();
     expect(hubspot.writeRequests()).toEqual([]);
     expect(hubspot.unexpected).toEqual([]);
