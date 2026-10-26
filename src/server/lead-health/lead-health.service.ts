@@ -82,7 +82,10 @@ function qualifyContact(
     ({ deal }) => deal.archivedAt === null && !(deal.isClosed === true && deal.isWon === false),
   );
   const priorClosedLost = contact.deals.some(({ deal }) => deal.archivedAt === null && deal.isClosed === true && deal.isWon === false);
-  if ((!sql && !mql) || hasNonLostDeal) return { eligible: false, priorClosedLost };
+  // A known closed-lost deal is an explicit reactivation exception: HubSpot may
+  // have advanced the contact lifecycle to Opportunity when the old deal was
+  // created, so don't require the contact to be reset to SQL manually.
+  if ((!sql && !mql && !priorClosedLost) || hasNonLostDeal) return { eligible: false, priorClosedLost };
   return { eligible: true, priorClosedLost };
 }
 
