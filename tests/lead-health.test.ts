@@ -57,10 +57,11 @@ beforeAll(async () => {
     createdate: qualifiedAt,
   });
   const lost = hubspot.addContact("lost@buyer.io", {
-    lifecyclestage: "salesqualifiedlead",
+    lifecyclestage: "opportunity",
     hubspot_owner_id: repOwner.id,
     hs_lead_status: "IN_PROGRESS",
-    hs_v2_date_entered_salesqualifiedlead: qualifiedAt,
+    notes_last_contacted: isoDaysAgo(9),
+    notes_last_updated: isoDaysAgo(9),
     createdate: qualifiedAt,
   });
   const mql = hubspot.addContact("mql@buyer.io", {
