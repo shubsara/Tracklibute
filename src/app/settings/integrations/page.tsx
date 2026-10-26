@@ -4,6 +4,7 @@ import { hasRole } from "@/domain/auth/auth-context";
 import { requirePageAuth } from "@/server/auth/page-session";
 import { getGmailStatus } from "@/server/integrations/gmail/gmail-connection.service";
 import { getHubSpotStatus } from "@/server/integrations/hubspot/hubspot-connection.service";
+import { listResponsibilities } from "@/server/responsibilities/responsibilities.service";
 
 import { GmailActions } from "./gmail-actions";
 import { HubSpotActions } from "./hubspot-actions";
@@ -44,12 +45,14 @@ export default async function IntegrationsPage({
   searchParams: Promise<{ gmail?: string; hubspot?: string; responsibilities?: string }>;
 }) {
   const auth = await requirePageAuth();
-  const [status, hubspot, { gmail, hubspot: hubspotNotice, responsibilities: respNotice }] = await Promise.all([
+  const [status, hubspot, responsibilities, { gmail, hubspot: hubspotNotice, responsibilities: respNotice }] = await Promise.all([
     getGmailStatus(auth),
     getHubSpotStatus(auth),
+    listResponsibilities(auth),
     searchParams,
   ]);
   const oh = hubspot.opportunityHealth;
+  const leadHealth = responsibilities.find((r) => r.templateKey === "lead_health") ?? null;
   const canConnect = auth.role !== "VIEWER";
   const isAdmin = hasRole(auth, "ADMIN");
 
@@ -135,6 +138,23 @@ export default async function IntegrationsPage({
                 </div>
               )}
             </div>
+            {leadHealth && (
+              <div className="space-y-2 border-t pt-3 text-sm">
+                <p className="font-medium">Lead Health</p>
+                {leadHealth.status !== "ACTIVE" ? (
+                  <p className="text-amber-700">Installed but {leadHealth.status.toLowerCase()}.</p>
+                ) : (
+                  <p className="text-neutral-600">
+                    Evaluates qualified HubSpot contacts, using matched Gmail activity and CRM activity timestamps. Active deals and customer contacts are excluded.
+                  </p>
+                )}
+                {isAdmin && leadHealth.status === "ACTIVE" && (
+                  <form method="post" action={`/api/responsibilities/${leadHealth.id}/run`}>
+                    <button type="submit" className="rounded border px-3 py-1">Run Lead Health now</button>
+                  </form>
+                )}
+              </div>
+            )}
             {isAdmin && <HubSpotActions />}
           </>
         ) : hubspot.status === "REAUTH_REQUIRED" ? (

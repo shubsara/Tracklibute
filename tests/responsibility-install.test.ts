@@ -205,7 +205,8 @@ describe("repairing an existing organization", () => {
     await flushAfter();
     const deal = await ownerDb().crmDeal.findFirstOrThrow({ where: { integrationId }, include: { health: true } });
     expect(deal.health?.state).toBe("NEEDS_ATTENTION");
-    const run = await ownerDb().responsibilityRun.findFirstOrThrow({ where: { organizationId: org.organizationId }, orderBy: { createdAt: "desc" } });
+    const opportunityHealth = await ownerDb().responsibility.findFirstOrThrow({ where: { organizationId: org.organizationId, templateKey: "opportunity_health" }, select: { id: true } });
+    const run = await ownerDb().responsibilityRun.findFirstOrThrow({ where: { organizationId: org.organizationId, responsibilityId: opportunityHealth.id }, orderBy: { createdAt: "desc" } });
     expect(run).toMatchObject({ status: "SUCCEEDED", summary: { trigger: "sync", dealsEvaluated: 1 } });
   });
 });

@@ -49,25 +49,26 @@ const deals = (integrationId: string) => ownerDb().crmDeal.findMany({ where: { i
 const integration = (id: string) => ownerDb().integration.findUniqueOrThrow({ where: { id } });
 
 describe("full reconcile", () => {
-  it("mirrors owners, stages, deals and ONLY deal-associated contacts/companies; auto-maps owners by email", async () => {
+  it("mirrors owners, stages, deals, all contacts (including standalone leads) and associated companies; auto-maps owners by email", async () => {
     const { org, admin, integrationId } = await setup();
     const owner = hubspot.addOwner({ email: org.members.MEMBER.email.toUpperCase(), firstName: "Mem", lastName: "Ber" });
     hubspot.addOwner({ email: "stranger@elsewhere.test" });
     const c1 = hubspot.addContact("pat@buyer.io");
-    hubspot.addContact("unrelated@nobody.io"); // never associated → never fetched
+    hubspot.addContact("unrelated@nobody.io"); // standalone contact: no deal association required
     const co = hubspot.addCompany("https://www.buyer.io");
     hubspot.addDeal({ dealname: "Buyer expansion", amount: "5000", hubspot_owner_id: owner.id, closedate: isoDaysAgo(-20) }, { contacts: [c1.id], companies: [co.id] });
     hubspot.addDeal({ dealname: "Won deal", dealstage: "closedwon" });
 
     const r = await syncHubSpot(admin, { trigger: "manual" });
-    expect(r).toMatchObject({ mode: "full", outcome: "completed", dealsUpserted: 2, contactsUpserted: 1, companiesUpserted: 1, ownersUpserted: 2, ownersAutoMapped: 1 });
+    expect(r).toMatchObject({ mode: "full", outcome: "completed", dealsUpserted: 2, contactsUpserted: 2, companiesUpserted: 1, ownersUpserted: 2, ownersAutoMapped: 1 });
 
     const rows = await deals(integrationId);
     expect(rows.map((d) => [d.name, d.isClosed])).toEqual([["Buyer expansion", false], ["Won deal", true]]);
     expect(rows[0]!.contacts).toHaveLength(1);
     expect(rows[0]!.companies).toHaveLength(1);
     expect(rows[0]!.amount?.toFixed(2)).toBe("5000.00");
-    expect(await ownerDb().crmContact.findMany({ where: { integrationId }, select: { email: true } })).toEqual([{ email: "pat@buyer.io" }]);
+    expect(await ownerDb().crmContact.findMany({ where: { integrationId }, select: { email: true } })).toEqual(expect.arrayContaining([{ email: "pat@buyer.io" }, { email: "unrelated@nobody.io" }]));
+    expect(await ownerDb().crmContact.count({ where: { integrationId } })).toBe(2);
     expect((await ownerDb().crmCompany.findFirstOrThrow({ where: { integrationId } })).domain).toBe("buyer.io");
     const mapping = await ownerDb().crmOwnerMapping.findFirstOrThrow({ where: { organizationId: org.organizationId } });
     expect(mapping).toMatchObject({ userId: org.members.MEMBER.userId, source: "AUTO_EMAIL" });
@@ -76,7 +77,7 @@ describe("full reconcile", () => {
     const row = await integration(integrationId);
     expect(row.fullSyncedAt).not.toBeNull();
     expect(row.backfillCursor).toBeNull();
-    expect(JSON.parse(row.syncCursor!)).toMatchObject({ v: 1, watermark: expect.any(Number) });
+    expect(JSON.parse(row.syncCursor!)).toMatchObject({ v: 2, watermark: expect.any(Number) });
     expect(row.syncLeaseExpiresAt).toBeNull();
     expect(hubspot.writeRequests()).toEqual([]);
     expect(hubspot.unexpected).toEqual([]);
@@ -172,6 +173,33 @@ describe("incremental", () => {
     await syncHubSpot(admin, { trigger: "manual" });
     await ownerDb().integration.update({ where: { id: integrationId }, data: { fullSyncedAt: new Date(Date.now() - 25 * 3_600_000) } });
     expect((await syncHubSpot(admin, { trigger: "manual" })).mode).toBe("full");
+  });
+
+  it("forces a one-time full contact backfill for a legacy v1 cursor", async () => {
+    const { admin, integrationId } = await setup();
+    const c = hubspot.addContact("legacy@buyer.io", {
+      lifecyclestage: "salesqualifiedlead",
+      hs_lead_status: "IN_PROGRESS",
+      hs_v2_date_entered_salesqualifiedlead: isoDaysAgo(5),
+    });
+    await syncHubSpot(admin, { trigger: "manual" });
+    await ownerDb().crmContact.update({
+      where: { organizationId_integrationId_externalId: { organizationId: admin.organizationId, integrationId, externalId: c.id } },
+      data: { lifecycleStage: null, leadStatus: null },
+    });
+    await ownerDb().integration.update({
+      where: { id: integrationId },
+      data: { fullSyncedAt: new Date(), syncCursor: JSON.stringify({ v: 1, watermark: Date.now() }) },
+    });
+    hubspot.requests = [];
+    const result = await syncHubSpot(admin, { trigger: "manual" });
+    expect(result.mode).toBe("full");
+    expect(hubspot.requests).toContain("GET /crm/v3/objects/contacts");
+    expect(await ownerDb().crmContact.findFirstOrThrow({ where: { integrationId, externalId: c.id } })).toMatchObject({
+      lifecycleStage: "salesqualifiedlead",
+      leadStatus: "in_progress",
+    });
+    expect(JSON.parse((await integration(integrationId)).syncCursor!).v).toBe(2);
   });
 });
 

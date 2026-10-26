@@ -4,6 +4,7 @@ import { getEnv } from "@/lib/env";
 import { log } from "@/lib/log";
 import { contextFromIdentity } from "@/server/auth/resolve";
 import { getAppDb } from "@/server/db/client";
+import { runLeadHealthAfterSync } from "@/server/lead-health/lead-health.service";
 import { runOpportunityHealthAfterSync } from "@/server/opportunity-health/opportunity-health.service";
 
 import { syncHubSpot } from "./hubspot-sync.service";
@@ -22,6 +23,9 @@ export interface HubSpotCronSummary {
     /** Post-sync Opportunity Health outcome (after a completed sync only). */
     health?: "succeeded" | "skipped" | "failed";
     healthErrorCode?: string;
+    /** Post-sync Lead Health outcome (after a completed sync only). */
+    leadHealth?: "succeeded" | "skipped" | "failed";
+    leadHealthErrorCode?: string;
   }>;
 }
 
@@ -66,6 +70,9 @@ export async function runHubSpotCronSync(opts: { limit?: number; totalBudgetMs?:
         const health = await runOpportunityHealthAfterSync(auth, "cron");
         entry.health = health.status;
         if (health.status === "failed") entry.healthErrorCode = health.errorCode;
+        const leadHealth = await runLeadHealthAfterSync(auth, "hubspot_cron");
+        entry.leadHealth = leadHealth.status;
+        if (leadHealth.status === "failed") entry.leadHealthErrorCode = leadHealth.errorCode;
       }
       summary.results.push(entry);
     } catch (err) {

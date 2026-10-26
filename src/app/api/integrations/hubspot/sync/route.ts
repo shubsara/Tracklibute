@@ -3,6 +3,7 @@ import { after } from "next/server";
 import { log } from "@/lib/log";
 import { authedRoute, isFormRequest, json, redirect } from "@/server/http/route";
 import { syncHubSpot } from "@/server/integrations/hubspot/hubspot-sync.service";
+import { runLeadHealthAfterSync } from "@/server/lead-health/lead-health.service";
 import { runOpportunityHealthAfterSync } from "@/server/opportunity-health/opportunity-health.service";
 
 export const dynamic = "force-dynamic";
@@ -15,7 +16,10 @@ export const POST = authedRoute(
     if (result.outcome === "completed") {
       try {
         // Never throws; failures are logged and surfaced via the HubSpot status.
-        after(() => runOpportunityHealthAfterSync(auth, "manual"));
+        after(async () => {
+          await runOpportunityHealthAfterSync(auth, "manual");
+          await runLeadHealthAfterSync(auth, "hubspot_manual");
+        });
       } catch {
         log.info("opportunity_health.deferred", {});
       }

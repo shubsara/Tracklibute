@@ -8,7 +8,7 @@ import {
   HubSpotClient,
   HubSpotRequestNotAllowedError,
 } from "@/server/integrations/hubspot/hubspot.client";
-import { mapCompany, mapDeal, mapStages, parseHubSpotDate } from "@/server/integrations/hubspot/hubspot.mapper";
+import { mapCompany, mapContact, mapDeal, mapStages, parseHubSpotDate } from "@/server/integrations/hubspot/hubspot.mapper";
 import { isWriteScope } from "@/server/integrations/hubspot/hubspot.oauth";
 
 import { VirtualClock } from "../support/fake-google";
@@ -68,6 +68,11 @@ describe("read-only allow-list", () => {
       ["GET", "/crm/v3/objects/deals/../tasks"],
     ];
     for (const [m, p] of refused) expect(() => assertAllowedHubSpotRequest(m, p)).toThrow(HubSpotRequestNotAllowedError);
+  });
+
+  it("allows only the explicit read-only contacts list endpoint for standalone lead discovery", () => {
+    expect(assertAllowedHubSpotRequest("GET", "/crm/v3/objects/contacts")).toBe("contacts.list");
+    expect(() => assertAllowedHubSpotRequest("POST", "/crm/v3/objects/contacts")).toThrow(HubSpotRequestNotAllowedError);
   });
 
   it("refuses before any network call", async () => {
@@ -156,6 +161,34 @@ describe("mapper", () => {
     expect(d.nextActivityAt).toBeInstanceOf(Date);
     expect(parseHubSpotDate("garbage")).toBeNull();
     expect(mapCompany({ id: "9", properties: { domain: "https://www.Buyer.io" } }).domain).toBe("buyer.io");
+  });
+
+  it("maps qualification and sales activity timestamps from HubSpot contacts", () => {
+    const contact = mapContact({
+      id: "902",
+      properties: {
+        email: "  QUALIFIED@Buyer.IO ",
+        firstname: "Qualified",
+        lastname: "Contact",
+        lifecyclestage: "salesqualifiedlead",
+        hs_lead_status: "IN_PROGRESS",
+        hubspot_owner_id: "507",
+        createdate: "2026-10-01T00:00:00.000Z",
+        lastmodifieddate: "2026-10-20T00:00:00.000Z",
+        notes_last_updated: "2026-10-19T00:00:00.000Z",
+        notes_last_contacted: "2026-10-18T00:00:00.000Z",
+        notes_next_activity_date: "2026-10-30T00:00:00.000Z",
+        hs_v2_date_entered_salesqualifiedlead: "2026-10-10T00:00:00.000Z",
+        hs_v2_date_entered_marketingqualifiedlead: null,
+      },
+    });
+    expect(contact).toMatchObject({
+      externalId: "902", email: "qualified@buyer.io", lifecycleStage: "salesqualifiedlead",
+      leadStatus: "in_progress", ownerExternalId: "507",
+    });
+    expect(contact.dateEnteredSalesQualifiedLead?.toISOString()).toBe("2026-10-10T00:00:00.000Z");
+    expect(contact.crmLastActivityAt?.toISOString()).toBe("2026-10-19T00:00:00.000Z");
+    expect(contact.nextActivityAt?.toISOString()).toBe("2026-10-30T00:00:00.000Z");
   });
 
   it("stages (2026-09 shape): missing or unusable isClosed stays UNKNOWN, never defaulted", () => {
