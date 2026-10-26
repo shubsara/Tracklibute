@@ -184,6 +184,7 @@ describe("Lead Health", () => {
     const dump = JSON.stringify(rec.evidence);
     expect(dump).not.toContain("sql@buyer.io");
     expect(dump).not.toContain("Following up on our conversation");
+  });
 
   it("marks signal as limited when a qualified contact's owner is unmapped", async () => {
     const contact = await localContact(lostContactId);
@@ -195,6 +196,5 @@ describe("Lead Health", () => {
       evidence: { ownerMapped: false, ownerMailboxConnected: false, limitedSignal: true },
     });
     expect((await leadRecommendation(lostContactId))!.summary).toContain("owner is unmapped or has no connected mailbox");
-  });
   });
 });
