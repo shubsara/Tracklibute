@@ -149,7 +149,7 @@ export async function runLeadHealth(auth: AuthContext, opts: LeadHealthRunOption
       const [connected, owners] = await Promise.all([
         // This SECURITY DEFINER helper returns mailbox-owner IDs without exposing
         // another member's private Gmail integration row to the current actor.
-        tx.$queryRaw<{ user_id: string }[]>\`SELECT user_id::text FROM app_connected_mailbox_user_ids()\`,
+        tx.$queryRaw<{ user_id: string }[]>`SELECT user_id::text FROM app_connected_mailbox_user_ids()`,
         tx.crmOwner.findMany({
           where: { organizationId: auth.organizationId, integrationId, mapping: { isNot: null } },
           select: { externalId: true, mapping: { select: { userId: true } } },
