@@ -25,6 +25,8 @@ export const leadHealthEvidenceSchema = z.object({
   lifecycleStage: normalizedProperty,
   leadStatus: normalizedProperty,
   connectedMailboxes: z.number().int().min(0),
+  ownerMapped: z.boolean(),
+  ownerMailboxConnected: z.boolean(),
   limitedSignal: z.boolean(),
   priorClosedLost: z.boolean(),
   contact: z.object({ id: z.uuid(), externalId: z.string().max(64) }).strict(),
