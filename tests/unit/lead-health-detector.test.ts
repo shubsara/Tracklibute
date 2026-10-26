@@ -50,12 +50,12 @@ describe("evaluateLead", () => {
   });
 
   it("general inactivity is needs-attention after three business days and at-risk after five", () => {
-    expect(codes({ lastInboundAt: ago(5), lastOutboundAt: ago(5), crmLastActivityAt: ago(5), crmLastContactedAt: ago(5), nextActivityAt: null })).toEqual(["INACTIVE:NEEDS_ATTENTION"]);
-    expect(codes({ lastInboundAt: ago(8), lastOutboundAt: ago(8), crmLastActivityAt: ago(8), crmLastContactedAt: ago(8), nextActivityAt: null })).toEqual(["INACTIVE:AT_RISK"]);
+    expect(codes({ qualificationAt: ago(12), lastInboundAt: ago(5), lastOutboundAt: ago(5), crmLastActivityAt: ago(5), crmLastContactedAt: ago(5), nextActivityAt: null })).toEqual(["INACTIVE:NEEDS_ATTENTION"]);
+    expect(codes({ qualificationAt: ago(12), lastInboundAt: ago(8), lastOutboundAt: ago(8), crmLastActivityAt: ago(8), crmLastContactedAt: ago(8), nextActivityAt: null })).toEqual(["INACTIVE:AT_RISK"]);
   });
 
   it("does not flag general inactivity when a future next activity is scheduled", () => {
-    expect(codes({ lastInboundAt: ago(10), lastOutboundAt: ago(11), crmLastActivityAt: ago(10), nextActivityAt: ahead(1) })).toEqual([]);
+    expect(codes({ lastInboundAt: ago(10), lastOutboundAt: ago(10), crmLastActivityAt: ago(10), nextActivityAt: ahead(1) })).toEqual([]);
     expect(codes({ qualificationAt: ago(9), lastInboundAt: null, lastOutboundAt: null, crmLastContactedAt: null, crmLastActivityAt: null, nextActivityAt: ahead(1) })).toEqual([]);
   });
 
