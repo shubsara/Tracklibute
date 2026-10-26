@@ -43,34 +43,40 @@ beforeAll(async () => {
   integrationId = (await connectHubSpotFixture(hubspot, admin, "555002")).integrationId;
   mailboxAddress = "rep-" + org.slug + "@seller.test";
   await connectGmailFixture(google, rep, mailboxAddress);
+  const repOwner = hubspot.addOwner({ email: rep.email, firstName: "Sales", lastName: "Rep" });
 
   const qualifiedAt = isoDaysAgo(6);
   const sql = hubspot.addContact("sql@buyer.io", {
     lifecyclestage: "salesqualifiedlead",
+    hubspot_owner_id: repOwner.id,
     hs_lead_status: "IN_PROGRESS",
     hs_v2_date_entered_salesqualifiedlead: qualifiedAt,
     createdate: qualifiedAt,
   });
   const lost = hubspot.addContact("lost@buyer.io", {
     lifecyclestage: "salesqualifiedlead",
+    hubspot_owner_id: repOwner.id,
     hs_lead_status: "IN_PROGRESS",
     hs_v2_date_entered_salesqualifiedlead: qualifiedAt,
     createdate: qualifiedAt,
   });
   const mql = hubspot.addContact("mql@buyer.io", {
     lifecyclestage: "marketingqualifiedlead",
+    hubspot_owner_id: repOwner.id,
     hs_lead_status: "NEW",
     hs_v2_date_entered_marketingqualifiedlead: qualifiedAt,
     createdate: qualifiedAt,
   });
   const active = hubspot.addContact("active@buyer.io", {
     lifecyclestage: "salesqualifiedlead",
+    hubspot_owner_id: repOwner.id,
     hs_lead_status: "IN_PROGRESS",
     hs_v2_date_entered_salesqualifiedlead: qualifiedAt,
     createdate: qualifiedAt,
   });
   const won = hubspot.addContact("won@buyer.io", {
     lifecyclestage: "salesqualifiedlead",
+    hubspot_owner_id: repOwner.id,
     hs_lead_status: "IN_PROGRESS",
     hs_v2_date_entered_salesqualifiedlead: qualifiedAt,
     createdate: qualifiedAt,
@@ -114,6 +120,7 @@ describe("Lead Health", () => {
       severity: "HIGH",
       title: "Pat Buyer has not received a first sales touch",
     });
+    expect((await leadRecommendation(sqlContactId))!.evidence).toMatchObject({ ownerMapped: true, ownerMailboxConnected: true, limitedSignal: false });
     expect(await leadRecommendation(lostContactId)).toMatchObject({ status: "OPEN", severity: "HIGH" });
     expect((await leadRecommendation(lostContactId))!.summary).toContain("prior closed-lost");
     expect(await leadRecommendation(mqlContactId)).toBeNull();
