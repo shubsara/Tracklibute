@@ -90,7 +90,8 @@ class LeaseLostError extends Error {
 }
 
 interface WatermarkCursor {
-  v: 1;
+  /** v1 predates the contact mirror; v2 confirms a complete contact reconcile. */
+  v: 1 | 2;
   watermark: number;
 }
 interface FullPassCursor {
@@ -109,7 +110,7 @@ function parseJson<T>(raw: string | null, check: (v: Record<string, unknown>) =>
     return null;
   }
 }
-const parseWatermark = (raw: string | null) => parseJson<WatermarkCursor>(raw, (v) => typeof v.watermark === "number");
+const parseWatermark = (raw: string | null) => parseJson<WatermarkCursor>(raw, (v) => (v.v === 1 || v.v === 2) && typeof v.watermark === "number");
 const parseFullPass = (raw: string | null) =>
   parseJson<FullPassCursor>(raw, (v) =>
     typeof v.passStartedAt === "string" &&
@@ -471,7 +472,7 @@ async function incremental(ctx: SyncCtx, source: CrmSource, cursor: WatermarkCur
     const page = await source.searchDealsModifiedSince(since, after);
     await persistDeals(ctx, source, page.items, null);
     for (const d of page.items) if (d.externalUpdatedAt) maxSeen = Math.max(maxSeen, d.externalUpdatedAt.getTime());
-    await checkpoint(ctx, { syncCursor: JSON.stringify({ v: 1, watermark: maxSeen }) });
+    await checkpoint(ctx, { syncCursor: JSON.stringify({ v: 2, watermark: maxSeen }) });
     if (page.capped) {
       // 10,000-result window exhausted: restart the query from the newest timestamp seen.
       since = maxSeen > since ? maxSeen : since + 1;
@@ -532,6 +533,7 @@ export async function syncHubSpot(auth: AuthContext, opts: HubSpotSyncOptions): 
     opts.forceFull ||
     fullCursor !== null ||
     watermark === null ||
+    watermark.v !== 2 ||
     !integration.fullSyncedAt ||
     started - integration.fullSyncedAt.getTime() > FULL_RECONCILE_EVERY_MS;
   const mode: HubSpotSyncMode = fullDue ? "full" : "incremental";
