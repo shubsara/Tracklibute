@@ -174,6 +174,33 @@ describe("incremental", () => {
     await ownerDb().integration.update({ where: { id: integrationId }, data: { fullSyncedAt: new Date(Date.now() - 25 * 3_600_000) } });
     expect((await syncHubSpot(admin, { trigger: "manual" })).mode).toBe("full");
   });
+
+  it("forces a one-time full contact backfill for a legacy v1 cursor", async () => {
+    const { admin, integrationId } = await setup();
+    const c = hubspot.addContact("legacy@buyer.io", {
+      lifecyclestage: "salesqualifiedlead",
+      hs_lead_status: "IN_PROGRESS",
+      hs_v2_date_entered_salesqualifiedlead: isoDaysAgo(5),
+    });
+    await syncHubSpot(admin, { trigger: "manual" });
+    await ownerDb().crmContact.update({
+      where: { organizationId_integrationId_externalId: { organizationId: admin.organizationId, integrationId, externalId: c.id } },
+      data: { lifecycleStage: null, leadStatus: null },
+    });
+    await ownerDb().integration.update({
+      where: { id: integrationId },
+      data: { fullSyncedAt: new Date(), syncCursor: JSON.stringify({ v: 1, watermark: Date.now() }) },
+    });
+    hubspot.requests = [];
+    const result = await syncHubSpot(admin, { trigger: "manual" });
+    expect(result.mode).toBe("full");
+    expect(hubspot.requests).toContain("GET /crm/v3/objects/contacts");
+    expect(await ownerDb().crmContact.findFirstOrThrow({ where: { integrationId, externalId: c.id } })).toMatchObject({
+      lifecycleStage: "salesqualifiedlead",
+      leadStatus: "in_progress",
+    });
+    expect(JSON.parse((await integration(integrationId)).syncCursor!).v).toBe(2);
+  });
 });
 
 describe("limits and safety", () => {
