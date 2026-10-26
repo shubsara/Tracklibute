@@ -456,7 +456,7 @@ async function fullPass(ctx: SyncCtx, source: CrmSource, existing: FullPassCurso
   const n = await withOrgScope(auth, (tx) => tx.$executeRaw`
     UPDATE integrations
        SET full_synced_at = ${passStartedAt}, backfill_cursor = NULL,
-           sync_cursor = ${JSON.stringify({ v: 1, watermark: passStartedAt.getTime() - WATERMARK_OVERLAP_MS })},
+           sync_cursor = ${JSON.stringify({ v: 2, watermark: passStartedAt.getTime() - WATERMARK_OVERLAP_MS })},
            updated_at = now()
      WHERE id = ${integrationId}::uuid AND sync_lease_expires_at = ${ctx.lease}`);
   if (n === 0) throw new LeaseLostError();
