@@ -524,11 +524,13 @@ PostgreSQL. Create a `tracklibute_app` role without `BYPASSRLS` before running
 - **Contact mirror:** full reconciliation fetches all non-archived HubSpot
   contacts, including those not associated with a deal. Qualification, lifecycle,
   owner, contact/activity timestamps and qualification-stage timestamps are
-  mirrored; stale records are archived only after the complete contact pass.
+  mirrored; stale records are archived only after the complete contact pass. A
+  legacy v1 sync cursor forces one full reconcile so existing portals populate
+  the new contact fields before returning to incremental sync.
 - **Qualification:** Sales Qualified Lead is included by default. Marketing
   Qualified Lead is optional. Customers and contacts explicitly marked
   Unqualified or Bad Timing are excluded. Any associated active or unknown-status
-  deal suppresses pre-opportunity Lead Health to avoid duplicate alerts.
+  deal suppresses pre-opportunity Lead Health to avoid duplicate alerts. A contact with only a known closed-lost deal remains eligible as a reactivation candidate, even if HubSpot advanced its lifecycle stage to Opportunity.
 - **Rules:** no first touch after more than 1 business day → NEEDS_ATTENTION;
   no first touch after more than 3 business days → AT_RISK. General inactivity
   after more than 3 business days → NEEDS_ATTENTION and more than 5 → AT_RISK.
