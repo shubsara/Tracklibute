@@ -541,7 +541,7 @@ PostgreSQL. Create a `tracklibute_app` role without `BYPASSRLS` before running
   Missing qualification timestamps never trigger guessed first-touch deadlines.
 - **Lifecycle:** one deduplicated recommendation per contact; recommendation
   resolves when the lead is healthy or no longer eligible. Leads without an
-  email address aren't classified as cold. A missing connected Gmail mailbox is
+  email address aren't classified as cold. An unmapped contact owner or one without a connected Gmail mailbox is
   recorded as limited signal, not hidden.
 - **Boundaries:** HubSpot remains read-only. No CRM writes, AI scoring, or email
   sending. Defaults need validation with the developer test portal before merge.
