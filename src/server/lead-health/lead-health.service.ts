@@ -66,13 +66,17 @@ async function aggregateContactActivity(tx: Tx, organizationId: string, contacts
   return out;
 }
 
+type ContactExclusionReason = "status" | "qualification_stage" | "deal";
+
 function qualifyContact(
   contact: { lifecycleStage: string | null; leadStatus: string | null; deals: Array<{ deal: { isClosed: boolean | null; isWon: boolean | null; archivedAt: Date | null } }> },
   config: LeadHealthConfig,
-): { eligible: boolean; priorClosedLost: boolean } {
+): { eligible: boolean; priorClosedLost: boolean; exclusionReason: ContactExclusionReason | null } {
   const lifecycle = normalizeCode(contact.lifecycleStage);
   const status = normalizeCode(contact.leadStatus);
-  if (status === "unqualified" || status === "badtiming" || lifecycle === "customer") return { eligible: false, priorClosedLost: false };
+  if (status === "unqualified" || status === "badtiming" || lifecycle === "customer") {
+    return { eligible: false, priorClosedLost: false, exclusionReason: "status" };
+  }
   const sql = lifecycle === "salesqualifiedlead";
   const mql = lifecycle === "marketingqualifiedlead" && config.includeMarketingQualifiedLeads;
   // Only an explicitly closed-lost history can remain eligible for reactivation.
@@ -85,14 +89,30 @@ function qualifyContact(
   // A known closed-lost deal is an explicit reactivation exception: HubSpot may
   // have advanced the contact lifecycle to Opportunity when the old deal was
   // created, so don't require the contact to be reset to SQL manually.
-  if ((!sql && !mql && !priorClosedLost) || hasNonLostDeal) return { eligible: false, priorClosedLost };
-  return { eligible: true, priorClosedLost };
+  if (hasNonLostDeal) return { eligible: false, priorClosedLost, exclusionReason: "deal" };
+  if (!sql && !mql && !priorClosedLost) {
+    return { eligible: false, priorClosedLost, exclusionReason: "qualification_stage" };
+  }
+  return { eligible: true, priorClosedLost, exclusionReason: null };
 }
 
 export interface LeadHealthRunResult {
-  runId: string; responsibilityId: string; contactsEvaluated: number; healthy: number;
-  needsAttention: number; atRisk: number; limitedSignal: number;
-  created: number; refreshed: number; reopened: number; resolved: number;
+  runId: string;
+  responsibilityId: string;
+  contactsFound: number;
+  contactsNotQualified: number;
+  contactsExcludedByStatus: number;
+  contactsBlockedByDeal: number;
+  contactsMissingEmail: number;
+  contactsEvaluated: number;
+  healthy: number;
+  needsAttention: number;
+  atRisk: number;
+  limitedSignal: number;
+  created: number;
+  refreshed: number;
+  reopened: number;
+  resolved: number;
 }
 export interface LeadHealthRunOptions { trigger: "manual" | "sync"; now?: Date; }
 
@@ -131,8 +151,22 @@ export async function runLeadHealth(auth: AuthContext, opts: LeadHealthRunOption
   });
 
   const result: LeadHealthRunResult = {
-    runId: run.id, responsibilityId: responsibility.id, contactsEvaluated: 0, healthy: 0,
-    needsAttention: 0, atRisk: 0, limitedSignal: 0, created: 0, refreshed: 0, reopened: 0, resolved: 0,
+    runId: run.id,
+    responsibilityId: responsibility.id,
+    contactsFound: 0,
+    contactsNotQualified: 0,
+    contactsExcludedByStatus: 0,
+    contactsBlockedByDeal: 0,
+    contactsMissingEmail: 0,
+    contactsEvaluated: 0,
+    healthy: 0,
+    needsAttention: 0,
+    atRisk: 0,
+    limitedSignal: 0,
+    created: 0,
+    refreshed: 0,
+    reopened: 0,
+    resolved: 0,
   };
 
   try {
@@ -170,6 +204,7 @@ export async function runLeadHealth(auth: AuthContext, opts: LeadHealthRunOption
       };
     });
 
+    result.contactsFound = data.contacts.length;
     const evaluatedKeys = new Set<string>();
     for (let i = 0; i < data.contacts.length; i += WRITE_CHUNK) {
       await withOrgScope(auth, async (tx) => {
@@ -177,9 +212,18 @@ export async function runLeadHealth(auth: AuthContext, opts: LeadHealthRunOption
           const qualification = qualifyContact(contact, config);
           const key = dedupeKeyForContact(contact.id);
           const existing = data.recByKey.get(key) ?? null;
+          if (!qualification.eligible) {
+            if (qualification.exclusionReason === "status") result.contactsExcludedByStatus++;
+            else if (qualification.exclusionReason === "deal") result.contactsBlockedByDeal++;
+            else result.contactsNotQualified++;
+            continue;
+          }
           // A missing email means Gmail activity cannot be matched. Do not
           // guess that the prospect is cold; CRM Hygiene can surface the gap.
-          if (!qualification.eligible || !contact.email) continue;
+          if (!contact.email) {
+            result.contactsMissingEmail++;
+            continue;
+          }
           const normalizedStage = normalizeCode(contact.lifecycleStage);
           const qualificationAt = normalizedStage === "salesqualifiedlead"
             ? contact.dateEnteredSalesQualifiedLead : contact.dateEnteredMarketingQualifiedLead;
