@@ -5,7 +5,7 @@ import { installSystemResponsibilities } from "@/server/responsibilities/respons
 import { disconnectAppDb } from "@/server/db/client";
 import { syncGmailMailbox } from "@/server/integrations/gmail/gmail-sync.service";
 import { syncHubSpot } from "@/server/integrations/hubspot/hubspot-sync.service";
-import { runLeadHealth } from "@/server/lead-health/lead-health.service";
+import { getLeadHealthLastRun, runLeadHealth } from "@/server/lead-health/lead-health.service";
 
 import { type FakeGoogle, gmailMessage } from "./support/fake-google";
 import type { FakeHubSpot } from "./support/fake-hubspot";
@@ -159,6 +159,17 @@ describe("Lead Health", () => {
       atRisk: 2,
       created: 2,
       limitedSignal: 0,
+    });
+    expect(await getLeadHealthLastRun(admin, responsibilityId)).toMatchObject({
+      status: "SUCCEEDED",
+      summary: {
+        contactsFound: 9,
+        contactsEvaluated: 2,
+        contactsNotQualified: 1,
+        contactsExcludedByStatus: 3,
+        contactsBlockedByDeal: 2,
+        contactsMissingEmail: 1,
+      },
     });
     expect(await leadRecommendation(sqlContactId)).toMatchObject({
       status: "OPEN",
