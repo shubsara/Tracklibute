@@ -17,7 +17,7 @@ export const POST = authedRoute<{ id: string }>(
     }
     if (responsibility.templateKey === "lead_health") {
       const result = await runLeadHealth(auth, { trigger: "manual" });
-      return isFormRequest(request) ? redirect("/recommendations") : json({ data: result });
+      return isFormRequest(request) ? redirect("/settings/integrations?lead_health=ran") : json({ data: result });
     }
     throw new NotFoundError("This responsibility has no detector yet");
   },
