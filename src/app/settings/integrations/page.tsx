@@ -5,6 +5,7 @@ import { requirePageAuth } from "@/server/auth/page-session";
 import { getGmailStatus } from "@/server/integrations/gmail/gmail-connection.service";
 import { getHubSpotStatus } from "@/server/integrations/hubspot/hubspot-connection.service";
 import { listResponsibilities } from "@/server/responsibilities/responsibilities.service";
+import { getLeadHealthLastRun } from "@/server/lead-health/lead-health.service";
 
 import { GmailActions } from "./gmail-actions";
 import { HubSpotActions } from "./hubspot-actions";
@@ -42,10 +43,10 @@ const RESPONSIBILITY_NOTICES: Record<string, string> = {
 export default async function IntegrationsPage({
   searchParams,
 }: {
-  searchParams: Promise<{ gmail?: string; hubspot?: string; responsibilities?: string }>;
+  searchParams: Promise<{ gmail?: string; hubspot?: string; responsibilities?: string; lead_health?: string }>;
 }) {
   const auth = await requirePageAuth();
-  const [status, hubspot, responsibilities, { gmail, hubspot: hubspotNotice, responsibilities: respNotice }] = await Promise.all([
+  const [status, hubspot, responsibilities, { gmail, hubspot: hubspotNotice, responsibilities: respNotice, lead_health: leadHealthNotice }] = await Promise.all([
     getGmailStatus(auth),
     getHubSpotStatus(auth),
     listResponsibilities(auth),
@@ -53,6 +54,7 @@ export default async function IntegrationsPage({
   ]);
   const oh = hubspot.opportunityHealth;
   const leadHealth = responsibilities.find((r) => r.templateKey === "lead_health") ?? null;
+  const leadHealthLastRun = leadHealth ? await getLeadHealthLastRun(auth, leadHealth.id) : null;
   const canConnect = auth.role !== "VIEWER";
   const isAdmin = hasRole(auth, "ADMIN");
 
@@ -62,6 +64,7 @@ export default async function IntegrationsPage({
       {gmail && NOTICES[gmail] && <p className="text-sm text-neutral-600">{NOTICES[gmail]}</p>}
       {hubspotNotice && HUBSPOT_NOTICES[hubspotNotice] && <p className="text-sm text-neutral-600">{HUBSPOT_NOTICES[hubspotNotice]}</p>}
       {respNotice && RESPONSIBILITY_NOTICES[respNotice] && <p className="text-sm text-neutral-600">{RESPONSIBILITY_NOTICES[respNotice]}</p>}
+      {leadHealthNotice === "ran" && <p className="text-sm text-neutral-600">Lead Health run finished. Latest evaluation details are shown below.</p>}
 
       <div className="space-y-3 rounded border p-4">
         <h2 className="font-medium">HubSpot</h2>
@@ -147,6 +150,33 @@ export default async function IntegrationsPage({
                   <p className="text-neutral-600">
                     Evaluates qualified HubSpot contacts, using matched Gmail activity and CRM activity timestamps. Active deals and customer contacts are excluded.
                   </p>
+                  {leadHealthLastRun && (
+                    <div className="space-y-1 text-neutral-600">
+                      <p>
+                        Last run {leadHealthLastRun.status.toLowerCase()}
+                        {leadHealthLastRun.finishedAt ? ` at ${fmt(leadHealthLastRun.finishedAt)}` : ""}
+                        {leadHealthLastRun.error ? ` · ${leadHealthLastRun.error}` : ""}
+                      </p>
+                      {leadHealthLastRun.summary?.contactsFound !== undefined && (
+                        <>
+                          <p>
+                            {leadHealthLastRun.summary.contactsEvaluated ?? 0} of {leadHealthLastRun.summary.contactsFound} contacts evaluated.
+                          </p>
+                          <p className="text-xs">
+                            Not qualified: {leadHealthLastRun.summary.contactsNotQualified ?? 0} ·
+                            Excluded by status: {leadHealthLastRun.summary.contactsExcludedByStatus ?? 0} ·
+                            Blocked by deal: {leadHealthLastRun.summary.contactsBlockedByDeal ?? 0} ·
+                            Missing email: {leadHealthLastRun.summary.contactsMissingEmail ?? 0}
+                          </p>
+                          <p className="text-xs">
+                            Needs attention: {leadHealthLastRun.summary.needsAttention ?? 0} ·
+                            At risk: {leadHealthLastRun.summary.atRisk ?? 0} ·
+                            Recommendations created: {leadHealthLastRun.summary.created ?? 0}
+                          </p>
+                        </>
+                      )}
+                    </div>
+                  )}
                 )}
                 {isAdmin && leadHealth.status === "ACTIVE" && (
                   <form method="post" action={`/api/responsibilities/${leadHealth.id}/run`}>
