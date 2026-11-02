@@ -9,10 +9,11 @@ import { runOpportunityHealthAfterSync } from "@/server/opportunity-health/oppor
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-/** ADMIN: "Sync now" (read-only). A completed sync re-evaluates Opportunity Health. */
+/** ADMIN: incremental or full read-only sync. A completed sync re-evaluates both health responsibilities. */
 export const POST = authedRoute(
   async ({ auth, request }) => {
-    const result = await syncHubSpot(auth, { trigger: "manual" });
+    const forceFull = new URL(request.url).searchParams.get("full") === "true";
+    const result = await syncHubSpot(auth, { trigger: "manual", forceFull });
     if (result.outcome === "completed") {
       try {
         // Never throws; failures are logged and surfaced via the HubSpot status.
