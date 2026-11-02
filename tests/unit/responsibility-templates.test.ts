@@ -23,6 +23,20 @@ describe("system responsibility templates", () => {
     for (const key of SYSTEM_TEMPLATE_KEYS) {
       expect(() => parseSystemConfig(key, defaultConfigFor(key))).not.toThrow();
     }
+    expect(defaultConfigFor("lead_health")).toMatchObject({
+      firstTouchWithinBusinessDays: 1,
+      firstTouchEscalateAfterBusinessDays: 3,
+      staleAfterDays: 3,
+      escalateAfterDays: 5,
+      awaitingReplyAfterBusinessDays: 2,
+      awaitingReplyEscalateAfterDays: 7,
+      includeMarketingQualifiedLeads: false,
+    });
+    // Previous pre-Lead-Health settings still parse through the compatibility key.
+    expect(parseSystemConfig("lead_health", { firstTouchWithinHours: 24, staleAfterDays: 3 })).toMatchObject({
+      firstTouchWithinBusinessDays: 1,
+      firstTouchEscalateAfterBusinessDays: 3,
+    });
   });
 
   it("rejects workflow-style config (triggers / conditions / steps)", () => {

@@ -7,6 +7,7 @@ import { ServiceUnavailableError, UnauthenticatedError } from "@/lib/errors";
 import { log } from "@/lib/log";
 import { contextFromIdentity } from "@/server/auth/resolve";
 import { getAppDb } from "@/server/db/client";
+import { runLeadHealthAfterSync } from "@/server/lead-health/lead-health.service";
 
 import { syncGmailMailbox } from "./gmail-sync.service";
 
@@ -71,6 +72,7 @@ export async function runGmailCronSync(opts: { limit?: number; totalBudgetMs?: n
       const outcome = r.outcome === "completed" ? "succeeded" : "partial";
       summary[outcome]++;
       summary.results.push({ integrationId: c.integration_id, outcome, messagesUpserted: r.messagesUpserted });
+      if (r.outcome === "completed") await runLeadHealthAfterSync(auth, "gmail_sync");
     } catch (err) {
       const code = err && typeof err === "object" && "code" in err ? String((err as { code: unknown }).code) : "error";
       const outcome = code === "conflict" ? "skipped" : "failed";

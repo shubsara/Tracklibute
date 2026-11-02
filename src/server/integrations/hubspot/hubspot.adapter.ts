@@ -129,6 +129,22 @@ export class HubSpotCrmSource implements CrmSource {
     );
   }
 
+  listContacts(after?: string): Promise<CrmPage<CrmContactRecord>> {
+    return translate(async () => {
+      const res = parse(
+        hubspotListSchema,
+        await this.client.get("contacts.list", "/crm/v3/objects/contacts", {
+          limit: String(LIST_PAGE_SIZE),
+          after,
+          archived: "false",
+          properties: CONTACT_PROPERTIES.join(","),
+        }),
+        "contacts.list",
+      );
+      return { items: res.results.map(mapContact), next: res.paging?.next?.after ?? null };
+    });
+  }
+
   listDeals(after?: string): Promise<CrmPage<CrmDealRecord>> {
     return translate(async () => {
       const res = parse(

@@ -30,7 +30,21 @@ export const DEAL_PROPERTIES = [
   "hs_is_closed",
   "hs_is_closed_won",
 ] as const;
-export const CONTACT_PROPERTIES = ["email", "firstname", "lastname", "lastmodifieddate"] as const;
+export const CONTACT_PROPERTIES = [
+  "email",
+  "firstname",
+  "lastname",
+  "lifecyclestage",
+  "hs_lead_status",
+  "hubspot_owner_id",
+  "createdate",
+  "lastmodifieddate",
+  "notes_last_updated",
+  "notes_last_contacted",
+  "notes_next_activity_date",
+  "hs_v2_date_entered_salesqualifiedlead",
+  "hs_v2_date_entered_marketingqualifiedlead",
+] as const;
 export const COMPANY_PROPERTIES = ["name", "domain", "hs_lastmodifieddate"] as const;
 
 const MAX_TEXT = 200;
@@ -94,7 +108,16 @@ export function mapContact(o: HubSpotObject): CrmContactRecord {
     email: p.email ? normalizeEmailAddress(p.email) : null,
     firstName: text(p.firstname, 100),
     lastName: text(p.lastname, 100),
+    lifecycleStage: text(p.lifecyclestage, 64)?.toLowerCase() ?? null,
+    leadStatus: text(p.hs_lead_status, 64)?.toLowerCase() ?? null,
+    ownerExternalId: id(p.hubspot_owner_id),
+    externalCreatedAt: parseHubSpotDate(p.createdate) ?? parseHubSpotDate(o.createdAt),
     externalUpdatedAt: parseHubSpotDate(p.lastmodifieddate) ?? parseHubSpotDate(o.updatedAt),
+    dateEnteredSalesQualifiedLead: parseHubSpotDate(p.hs_v2_date_entered_salesqualifiedlead),
+    dateEnteredMarketingQualifiedLead: parseHubSpotDate(p.hs_v2_date_entered_marketingqualifiedlead),
+    crmLastActivityAt: parseHubSpotDate(p.notes_last_updated),
+    crmLastContactedAt: parseHubSpotDate(p.notes_last_contacted),
+    nextActivityAt: parseHubSpotDate(p.notes_next_activity_date),
   };
 }
 

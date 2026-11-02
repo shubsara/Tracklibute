@@ -15,8 +15,8 @@ import type { IntegrationProviderKey } from "@/domain/integrations/providers";
  * Config objects are flat, typed parameters — deliberately NOT rules,
  * conditions, or step lists. There is no workflow builder.
  *
- * Detection logic arrives per template in its own spec. Opportunity Health is
- * implemented (Build Spec 03): deterministic, HubSpot + Gmail only.
+ * Detection logic arrives per template in its own spec. Opportunity Health and
+ * Lead Health are deterministic, HubSpot + Gmail responsibilities; HubSpot remains read-only.
  */
 export const SYSTEM_TEMPLATE_KEYS = [
   "lead_health",
@@ -47,8 +47,15 @@ export const SYSTEM_RESPONSIBILITY_TEMPLATES = {
     requiredProviders: ["HUBSPOT", "GMAIL"],
     configSchema: z
       .object({
-        firstTouchWithinHours: hours(24),
+        // Legacy key retained so previously persisted configs stay valid.
+        firstTouchWithinHours: hours(24).optional(),
+        firstTouchWithinBusinessDays: days(1),
         staleAfterDays: days(3),
+        escalateAfterDays: days(5),
+        firstTouchEscalateAfterBusinessDays: days(3),
+        awaitingReplyAfterBusinessDays: days(2),
+        awaitingReplyEscalateAfterDays: days(7),
+        includeMarketingQualifiedLeads: z.boolean().default(false),
       })
       .strict(),
   },

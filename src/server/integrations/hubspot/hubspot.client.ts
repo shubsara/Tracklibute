@@ -31,6 +31,7 @@ export type HubSpotEndpoint =
   | "owners.list"
   | "pipelines.deals"
   | "deals.list"
+  | "contacts.list"
   | "deals.search"
   | "associations.batchRead"
   | "contacts.batchRead"
@@ -51,6 +52,7 @@ export const HUBSPOT_ALLOWED_REQUESTS: readonly AllowedRequest[] = [
   // Pipelines 2026-09 (read): deal pipelines only.
   { endpoint: "pipelines.deals", method: "GET", path: /^\/crm\/pipelines\/2026-09\/deals$/ },
   { endpoint: "deals.list", method: "GET", path: /^\/crm\/v3\/objects\/deals$/ },
+  { endpoint: "contacts.list", method: "GET", path: /^\/crm\/v3\/objects\/contacts$/ },
   { endpoint: "deals.search", method: "POST", path: /^\/crm\/v3\/objects\/deals\/search$/ },
   { endpoint: "associations.batchRead", method: "POST", path: /^\/crm\/v4\/associations\/deals\/(contacts|companies)\/batch\/read$/ },
   { endpoint: "contacts.batchRead", method: "POST", path: /^\/crm\/v3\/objects\/contacts\/batch\/read$/ },

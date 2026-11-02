@@ -52,7 +52,16 @@ export interface CrmContactRecord {
   readonly email: string | null;
   readonly firstName: string | null;
   readonly lastName: string | null;
+  readonly lifecycleStage: string | null;
+  readonly leadStatus: string | null;
+  readonly ownerExternalId: string | null;
+  readonly externalCreatedAt: Date | null;
   readonly externalUpdatedAt: Date | null;
+  readonly dateEnteredSalesQualifiedLead: Date | null;
+  readonly dateEnteredMarketingQualifiedLead: Date | null;
+  readonly crmLastActivityAt: Date | null;
+  readonly crmLastContactedAt: Date | null;
+  readonly nextActivityAt: Date | null;
 }
 
 export interface CrmCompanyRecord {
@@ -76,6 +85,8 @@ export interface CrmSource {
   listDealStages(): Promise<readonly CrmStageRecord[]>;
   /** Full listing with embedded associations (reconcile pass). */
   listDeals(after?: string): Promise<CrmPage<CrmDealRecord>>;
+  /** Full listing of all contacts, including contacts not yet associated with a deal. */
+  listContacts(after?: string): Promise<CrmPage<CrmContactRecord>>;
   /**
    * Deals modified at or after `since` (ms), oldest first. `next` is an
    * opaque offset; null at the end. `capped` = the provider's result window
