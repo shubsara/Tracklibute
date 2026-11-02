@@ -253,6 +253,27 @@ describe("limits and safety", () => {
     await expect(syncHubSpot(admin, { trigger: "manual" })).rejects.toMatchObject({ code: "conflict" });
   });
 
+  it("ADMIN can request a full contact reconciliation from the integrations page", async () => {
+    const { org, admin, integrationId } = await setup();
+    const contact = hubspot.addContact("standalone@buyer.io", { lifecyclestage: "lead" });
+    await syncHubSpot(admin, { trigger: "manual" });
+
+    // A standalone contact is not part of incremental deal search. A manual
+    // full sync must refresh its lifecycle stage from HubSpot.
+    contact.properties.lifecyclestage = "salesqualifiedlead";
+    contact.properties.hs_v2_date_entered_salesqualifiedlead = isoDaysAgo(3);
+    hubspot.requests = [];
+    const response = await syncRoute(req("/api/integrations/hubspot/sync?full=true", admin, { method: "POST" }));
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.data).toMatchObject({ mode: "full", outcome: "completed", contactsUpserted: 1 });
+    expect(hubspot.requests).toContain("GET /crm/v3/objects/contacts");
+    expect(await ownerDb().crmContact.findFirstOrThrow({
+      where: { organizationId: org.organizationId, integrationId, externalId: contact.id },
+    })).toMatchObject({ lifecycleStage: "salesqualifiedlead" });
+    expect(hubspot.writeRequests()).toEqual([]);
+  });
+
   it("transient failures keep progress and leave the integration CONNECTED", async () => {
     const { admin, integrationId } = await setup();
     hubspot.fail(/^\/crm\/v3\/owners$/, 503, 10);
