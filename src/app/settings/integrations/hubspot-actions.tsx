@@ -18,7 +18,7 @@ export function HubSpotActions() {
       const res = await fetch(path, { method });
       const body = (await res.json().catch(() => ({}))) as {
         error?: { message?: string };
-        data?: { dealsUpserted?: number; outcome?: "completed" | "partial" };
+        data?: { dealsUpserted?: number; contactsUpserted?: number; outcome?: "completed" | "partial" };
       };
       setMessage(
         !res.ok
