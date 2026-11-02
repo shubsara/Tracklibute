@@ -364,9 +364,12 @@ Google's limits (Usage limits page, updated 2026-09-10):
     `hs_is_closed` is used. Otherwise the status is stored as **unknown**.
     Unknown-status deals are never evaluated by Opportunity Health, and their
     recommendations are left untouched.
-  - A **full reconcile** (deals list with embedded associations) runs on first
-    connect and every 24 h. It is resumable, and deals not seen in a
-    *complete* pass are archived.
+  - A **full reconcile** (deals list with embedded associations plus every
+    contact, including standalone contacts) runs on first connect and every 24 h.
+    It is resumable, and deals/contacts not seen in a *complete* pass are archived.
+    An ADMIN can also choose **Full sync now** on Settings → Integrations to
+    force this reconcile immediately; the ordinary **Sync now** uses the
+    incremental deal watermark between full passes.
   - Between full passes, an **incremental** search on
     `hs_lastmodifieddate ≥ watermark` runs, oldest first. Associations come from
     v4 batch reads. At HubSpot's 10,000-result search window, the query
@@ -546,7 +549,9 @@ PostgreSQL. Create a `tracklibute_app` role without `BYPASSRLS` before running
 - **Lifecycle:** one deduplicated recommendation per contact; recommendation
   resolves when the lead is healthy or no longer eligible. Leads without an
   email address aren't classified as cold. An unmapped contact owner or one without a connected Gmail mailbox is
-  recorded as limited signal, not hidden.
+  recorded as limited signal, not hidden. Each run reports how many contacts were
+  found, not qualified, excluded by status, blocked by an associated deal, missing
+  an email address, and actually evaluated.
 - **Boundaries:** HubSpot remains read-only. No CRM writes, AI scoring, or email
   sending. Defaults need validation with the developer test portal before merge.
 
