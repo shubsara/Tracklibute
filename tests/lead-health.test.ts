@@ -105,6 +105,14 @@ beforeAll(async () => {
     hs_lead_status: "IN_PROGRESS",
     createdate: qualifiedAt,
   });
+  // Eligible lifecycle stage but no email: should be counted as missing signal,
+  // never classified as a cold lead.
+  hubspot.addContact(null, {
+    lifecyclestage: "salesqualifiedlead",
+    hubspot_owner_id: repOwner.id,
+    hs_v2_date_entered_salesqualifiedlead: qualifiedAt,
+    createdate: qualifiedAt,
+  });
   sqlContactId = sql.id;
   lostContactId = lost.id;
   mqlContactId = mql.id;
@@ -141,7 +149,17 @@ const leadRecommendation = async (externalId: string) => {
 describe("Lead Health", () => {
   it("detects qualified standalone contacts, excludes MQL by default and contacts with an active deal", async () => {
     const r = await runLeadHealth(admin, { trigger: "manual" });
-    expect(r).toMatchObject({ contactsEvaluated: 2, atRisk: 2, created: 2, limitedSignal: 0 });
+    expect(r).toMatchObject({
+      contactsFound: 9,
+      contactsNotQualified: 1,
+      contactsExcludedByStatus: 3,
+      contactsBlockedByDeal: 2,
+      contactsMissingEmail: 1,
+      contactsEvaluated: 2,
+      atRisk: 2,
+      created: 2,
+      limitedSignal: 0,
+    });
     expect(await leadRecommendation(sqlContactId)).toMatchObject({
       status: "OPEN",
       severity: "HIGH",
@@ -162,7 +180,7 @@ describe("Lead Health", () => {
       where: { organizationId: org.organizationId, integrationId, archivedAt: null },
       select: { email: true, lifecycleStage: true, leadStatus: true, dateEnteredSalesQualifiedLead: true },
     });
-    expect(rows).toHaveLength(8);
+    expect(rows).toHaveLength(9);
     expect(rows.find((row) => row.email === "sql@buyer.io")).toMatchObject({ lifecycleStage: "salesqualifiedlead", leadStatus: "in_progress" });
   });
 
