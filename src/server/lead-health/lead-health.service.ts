@@ -116,6 +116,33 @@ export interface LeadHealthRunResult {
 }
 export interface LeadHealthRunOptions { trigger: "manual" | "sync"; now?: Date; }
 
+export interface LeadHealthLastRun {
+  status: string;
+  finishedAt: string | null;
+  error: string | null;
+  summary: Partial<LeadHealthRunResult> | null;
+}
+
+/** Latest run summary for the Integrations → Lead Health status panel. */
+export async function getLeadHealthLastRun(auth: AuthContext, responsibilityId: string): Promise<LeadHealthLastRun | null> {
+  const row = await withOrgScope(auth, (tx) =>
+    tx.responsibilityRun.findFirst({
+      where: { organizationId: auth.organizationId, responsibilityId },
+      orderBy: { createdAt: "desc" },
+      select: { status: true, finishedAt: true, error: true, summary: true },
+    }),
+  );
+  if (!row) return null;
+  return {
+    status: row.status,
+    finishedAt: row.finishedAt?.toISOString() ?? null,
+    error: row.error,
+    summary: row.summary && typeof row.summary === "object" && !Array.isArray(row.summary)
+      ? (row.summary as unknown as Partial<LeadHealthRunResult>)
+      : null,
+  };
+}
+
 export async function runLeadHealth(auth: AuthContext, opts: LeadHealthRunOptions): Promise<LeadHealthRunResult> {
   requireRole(auth, opts.trigger === "manual" ? "ADMIN" : "MEMBER");
   const actor = opts.trigger === "manual" ? "USER" : "SYSTEM";
