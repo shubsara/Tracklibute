@@ -4,8 +4,8 @@ import { hasRole } from "@/domain/auth/auth-context";
 import { requirePageAuth } from "@/server/auth/page-session";
 import { getGmailStatus } from "@/server/integrations/gmail/gmail-connection.service";
 import { getHubSpotStatus } from "@/server/integrations/hubspot/hubspot-connection.service";
-import { listResponsibilities } from "@/server/responsibilities/responsibilities.service";
 import { getLeadHealthLastRun } from "@/server/lead-health/lead-health.service";
+import { listResponsibilities } from "@/server/responsibilities/responsibilities.service";
 
 import { GmailActions } from "./gmail-actions";
 import { HubSpotActions } from "./hubspot-actions";
